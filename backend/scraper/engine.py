@@ -49,6 +49,7 @@ logging.basicConfig(
     level=logging.INFO,
     handlers=[handler]
 )
+
 logger = logging.getLogger("ENGINE")
 
 # --- Exceptions ---
@@ -386,37 +387,40 @@ def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode, user
         if brand_obj:
             is_brand = True
             keywords = [k.strip() for k in brand_obj.keywords.split(",")] if brand_obj.keywords else [brand_obj.name]
+            log(f"Job {job_id}: Brand Tracker mode for '{sector}' (Keywords: {keywords})")
         else:
             keywords = SECTOR_KEYWORDS.get(sector.lower(), [sector])
+            log(f"Job {job_id}: Sector mode for '{sector}' (Mode: {search_mode}, Keywords: {keywords})")
+
+        # Future: search_mode could alter the discover_articles logic (e.g. LLM-based filtering)
+        if search_mode == "smart":
+            log(f"Job {job_id}: Smart Search enabled. Applying AI precision discovery filters.")
 
         geo = REGION_MAP.get(region.lower(), {"geo": "IN"})["geo"]
         all_discovered = []
         cumulative = set()
         
-        # Parallel Discovery (Issue #4)
-        from asgiref.sync import async_to_sync
-        import asyncio
+        # Parallel Discovery (Standardized for Gevent/Windows stability)
+        discovery_pool = Pool(10)
         
+        def discover_wrapper(kws, d, g, r, j, c):
+            try:
+                res = discover_articles(kws, d, g, r, j, c)
+                all_discovered.extend(res)
+            except Exception as e:
+                logger.error(f"Discovery error for date {d}: {e}")
+
         dates = []
         curr = date_from
         while curr <= date_to:
             dates.append(curr)
             curr += timedelta(days=1)
 
-        async def _parallel_discovery():
-            tasks = []
-            for d in dates:
-                if is_job_cancelled(job_id): break
-                tasks.append(asyncio.to_thread(discover_articles, keywords, d, geo, region, job_id, cumulative))
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    all_discovered.extend(res)
-                elif isinstance(res, Exception):
-                    logger.error(f"Discovery error in parallel batch: {res}")
-
-        async_to_sync(_parallel_discovery)()
+        for d in dates:
+            if is_job_cancelled(job_id): break
+            discovery_pool.spawn(discover_wrapper, keywords, d, geo, region, job_id, cumulative)
+        
+        discovery_pool.join()
         
         db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(cumulative_found=len(cumulative)))
         update_phase_status(db, job_id, "Discovery", "completed")

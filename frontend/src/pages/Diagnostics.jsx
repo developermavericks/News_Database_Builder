@@ -67,15 +67,16 @@ export default function Diagnostics() {
 
         try {
             setLoading(true);
-            const res = await api.post("/diagnostics/emergency-stop", { phrase });
+            const res = await api.post("diagnostics/emergency-stop", { phrase });
             alert("Emergency Stop Triggered: " + (res.results?.actions?.join(", ") || "Success"));
             await fetchDiagnostics();
         } catch (e) {
             console.error(e);
+            const errorDetail = e.response?.data?.detail || e.message || "Unknown Error";
             if (e.response?.status === 403) {
                 alert("ACCESS DENIED: The authorization phrase was incorrect.");
             } else {
-                alert("Failed to trigger emergency stop.");
+                alert(`Failed to trigger emergency stop: ${errorDetail}`);
             }
         } finally {
             setLoading(false);

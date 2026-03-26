@@ -165,7 +165,7 @@ export default function Jobs() {
       useStore.setState({
         jobs: useStore.getState().jobs.map(j => j.id === id ? updated : j)
       });
-    } catch { }
+    } catch (err) { }
   };
 
   const deleteJob = async (id) => {
@@ -175,7 +175,7 @@ export default function Jobs() {
       useStore.setState({
         jobs: useStore.getState().jobs.filter(j => j.id !== id)
       });
-    } catch { }
+    } catch (err) { }
   };
 
   const safeJobs = Array.isArray(jobs) ? jobs : [];

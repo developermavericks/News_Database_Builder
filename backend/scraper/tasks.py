@@ -1,5 +1,6 @@
 import logging
 import json
+import hashlib
 import httpx
 import trafilatura
 from datetime import datetime

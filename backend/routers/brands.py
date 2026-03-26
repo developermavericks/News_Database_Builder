@@ -104,31 +104,35 @@ async def delete_brand(name: str, current_user: TokenData = Depends(get_current_
 
 @router.post("/scrape")
 async def trigger_brand_scrape(region: str = "india", days: int = 1, current_user: TokenData = Depends(get_current_user)):
-    """Trigger a scale using Celery."""
+    """Trigger a scrape for all watched brands."""
     async with get_db() as db:
         res = await db.execute(select(WatchedBrand).where(WatchedBrand.user_id == current_user.id))
         brands = res.scalars().all()
         if not brands:
             raise HTTPException(400, "No brands to scrape.")
         
-        job_id = str(uuid.uuid4())
+        job_ids = []
         date_to = date.today()
         date_from = date_to - timedelta(days=days)
 
-        new_job = ScrapeJob(
-            id=job_id, sector="brand_tracker", region=region,
-            user_id=current_user.id, date_from=date_from, date_to=date_to,
-            status='pending', started_at=datetime.now()
-        )
-        db.add(new_job)
-        await db.commit()
+        for brand in brands:
+            job_id = str(uuid.uuid4())
+            new_job = ScrapeJob(
+                id=job_id, sector=brand.name, region=brand.region or region,
+                user_id=current_user.id, date_from=date_from, date_to=date_to,
+                status='pending', started_at=datetime.now()
+            )
+            db.add(new_job)
+            job_ids.append(job_id)
 
-        # Simplified for orchestrated engine
-        celery_app.send_task(
-            "scraper.tasks.run_scrape_task",
-            args=[job_id, "brand_tracker", region, str(date_from), str(date_to), "broad", current_user.id]
-        )
-        return {"job_id": job_id, "status": "pending"}
+            # Dispatch individual task per brand
+            celery_app.send_task(
+                "scraper.tasks.run_scrape_task",
+                args=[job_id, brand.name, brand.region or region, str(date_from), str(date_to), "broad", current_user.id]
+            )
+            
+        await db.commit()
+        return {"status": "success", "jobs_started": len(job_ids), "job_ids": job_ids}
 
 @router.post("/scrape/{name}")
 async def trigger_individual_brand_scrape(name: str, days: int = 1, current_user: TokenData = Depends(get_current_user)):

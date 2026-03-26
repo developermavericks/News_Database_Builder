@@ -13,6 +13,7 @@ import AdminUserDetail from "./pages/AdminUserDetail";
 import AdminJobDetail from "./pages/AdminJobDetail";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
+import NewScrape from "./pages/NewScrape";
 import ErrorBoundary from "./components/ErrorBoundary";
 import "./index.css";
 
@@ -94,7 +95,7 @@ function ProtectedApp() {
       ws = new WebSocket(`${protocol}//${target}/api/articles/ws/stats?token=${token}`);
       ws.onopen = () => {
         setApiStatus("online");
-        console.log("WebSocket connected to Railway node.");
+        console.log("WebSocket connected.");
       };
       ws.onmessage = (msg) => {
         setApiStatus("online");
@@ -164,6 +165,7 @@ function ProtectedApp() {
 
       <main className="main-content">
         {page === "dashboard" && <Dashboard onNavigate={setPage} />}
+        {page === "new-scrape" && <NewScrape onNavigate={handleNavigate} />}
         {page === "articles" && <ArticlesBrowser />}
         {page === "brands" && <BrandTracker />}
         {page === "jobs" && <Jobs />}

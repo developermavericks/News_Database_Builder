@@ -148,7 +148,7 @@ export default function Dashboard({ onNavigate }) {
       <div className="card" style={{ background: 'var(--surface2)', border: 'none' }}>
         <div className="card-title">Strategic Actions</div>
         <div style={{ display: "flex", gap: 16, marginTop: '20px' }}>
-          <button className="btn btn-primary" onClick={() => onNavigate("scrape")} style={{ padding: '12px 24px' }}>
+          <button className="btn btn-primary" onClick={() => onNavigate("new-scrape")} style={{ padding: '12px 24px' }}>
             ⊕ New Intelligence Mission
           </button>
           <button className="btn btn-secondary" onClick={() => onNavigate("articles")}>
