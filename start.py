@@ -103,8 +103,17 @@ def main():
         # Start API
         start_service("Backend API", [python_exe, "run_backend.py"], backend_dir, "api.log")
         
-        # Start Worker (-P gevent for Windows stability and high I/O throughput)
-        start_service("Celery Worker", [python_exe, "-m", "celery", "-A", "celery_app", "worker", "--loglevel=info", "-P", "gevent", "--concurrency=" + os.getenv("CELERY_WORKER_CONCURRENCY", "16")], backend_dir, "worker.log")
+        # Start Worker (-P solo for 16GB to allow asyncio concurrency without gevent conflicts)
+        # For 64GB, solo is also preferred to leverage the new async engine efficiency.
+        hw_profile = env.get("HARDWARE_PROFILE", "16GB")
+        pool_type = "solo"
+        
+        logger.info(f"Starting Celery Worker with {pool_type} pool ({hw_profile} profile)...")
+        start_service("Celery Worker", [
+            python_exe, "-m", "celery", "-A", "celery_app", "worker", 
+            "--loglevel=info", "-P", pool_type,
+            "--prefetch-multiplier=1"
+        ], backend_dir, "worker.log")
         
         # Start Beat (Scheduler)
         start_service("Celery Beat", [python_exe, "-m", "celery", "-A", "celery_app", "beat", "--loglevel=info"], backend_dir, "beat.log")

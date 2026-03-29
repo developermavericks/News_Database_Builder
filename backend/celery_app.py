@@ -30,6 +30,8 @@ env_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env.local
 if os.path.exists(env_local):
     load_dotenv(env_local, override=True)
 
+from config import CURRENT_PROFILE
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 app = Celery(
@@ -44,11 +46,12 @@ app.conf.update(
     result_serializer="json",
     timezone="Asia/Kolkata",
     enable_utc=True,
-    task_soft_time_limit=25 * 60,   # 25 minutes
-    task_time_limit=30 * 60,        # 30 minutes
-    # Note: With prefork, concurrency refers to child processes.
-    worker_concurrency=int(os.getenv("CELERY_WORKER_CONCURRENCY", "8")), 
-    worker_prefetch_multiplier=10,   
+    task_soft_time_limit=CURRENT_PROFILE["TASK_SOFT_TIME_LIMIT"],
+    task_time_limit=CURRENT_PROFILE["TASK_TIME_LIMIT"],
+    # Hardware-tuned limits
+    worker_concurrency=CURRENT_PROFILE["CELERY_CONCURRENCY"],
+    worker_max_memory_per_child=CURRENT_PROFILE["WORKER_MAX_MEMORY"],
+    worker_prefetch_multiplier=1,   
     task_acks_late=True,           
     task_reject_on_worker_lost=True, 
     task_routes={

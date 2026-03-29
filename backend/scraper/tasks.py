@@ -5,6 +5,7 @@ import httpx
 import trafilatura
 from datetime import datetime
 from celery_app import app as celery_app
+from config import run_async
 from db.database import get_db_sync, Article, ScrapeJob
 from scraper.orchestrator import _mark_article_processed
 from scraper.browser import scrape_url
@@ -13,23 +14,18 @@ from sqlalchemy import select, update
 logger = logging.getLogger(__name__)
 
 
-# _mark_article_processed moved to orchestrator.py
-
-
-# ─── Orchestrator Task ────────────────────────────────────────────────────────
+# --- Orchestrator Task --------------------------------------------------------
 
 @celery_app.task(name="scraper.tasks.run_scrape_task", bind=True)
 def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mode, user_id):
     """
     Orchestrator: Discovers URLs and dispatches independent scraping nodes.
-    Now fully synchronous for gevent compatibility.
-    Celery tasks run server-side and persist through user logout.
+    Bridges to the async run_scrape_job implementation.
     """
-    logger.info(f"Starting Orchestrator for job {job_id}")
-    # Late import to break circularity
+    logger.info(f"Starting Orchestrator (Async-Bridged) for job {job_id}")
     from scraper.engine import run_scrape_job
     try:
-        run_scrape_job(
+        run_async(run_scrape_job(
             job_id=job_id,
             sector=sector,
             region=region,
@@ -37,7 +33,7 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
             date_to=date_to,
             search_mode=search_mode,
             user_id=user_id
-        )
+        ))
         logger.info(f"Discovery phase for job {job_id} completed.")
     except Exception as e:
         logger.error(f"Orchestrator failed for job {job_id}: {e}")
@@ -91,10 +87,10 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
         except Exception as e:
             logger.debug(f"Fast-track failed for {resolved_url}: {e}")
 
-        # --- FALLBACK: SUBPROCESS BROWSER (Disabled in scaling mode) ---
+        # --- FALLBACK: POOLED BROWSER ---
         if not html and not scaling_mode:
-            logger.info(f"Falling back to Playwright for {resolved_url}")
-            html = scrape_url(resolved_url)
+            logger.info(f"Falling back to Pooled Browser for {resolved_url}")
+            html = run_async(scrape_url(resolved_url))
             
         if not html:
             logger.warning(f"Scrape failed for {resolved_url} (Job: {job_id})")
@@ -105,7 +101,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
         article_data["resolved_url"] = resolved_url
         article_data["raw_html"] = html
 
-        article_id = scrape_only(article_data, job_id, sector, region, user_id)
+        article_id = run_async(scrape_only(article_data, job_id, sector, region, user_id))
         if article_id:
             # Mark as processed in Redis for O(1) deduplication in future discovery
             redis = get_redis_sync()

@@ -27,6 +27,8 @@ def get_database_url():
 
 from sqlalchemy.pool import NullPool, QueuePool
 
+from config import CURRENT_PROFILE
+
 # Selective Pooling: Use NullPool for workers to prevent gevent/asyncpg lifecycle conflicts.
 # The user's log analysis highlighted that asyncpg termination fails when many workers share a pool.
 use_nullpool = os.getenv("DB_USE_NULLPOOL", "false").lower() == "true"
@@ -39,10 +41,10 @@ engine_args = {
 if use_nullpool:
     engine_args["poolclass"] = NullPool
 elif "sqlite" not in get_database_url():
-    # Performance-ready QueuePool for Postgres
+    # Hardware-tuned QueuePool for Postgres
     engine_args.update({
-        "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
-        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        "pool_size": CURRENT_PROFILE["DB_POOL_SIZE"],
+        "max_overflow": CURRENT_PROFILE["DB_MAX_OVERFLOW"],
         "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
         "pool_recycle": 1800,
         "pool_pre_ping": True,

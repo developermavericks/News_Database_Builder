@@ -62,18 +62,40 @@ def load_proxies():
     proxies = list(dict.fromkeys(proxies))
     return proxies
 
-# Concurrency Control: Cap active Google News requests to 5
-google_semaphore = BoundedSemaphore(5)
+import asyncio
+import random
+import logging
+import httpx
+import hashlib
+import os
+from typing import Optional, List
+from scraper.llm import get_redis_sync
+from scraper.config import USER_AGENTS
+
+logger = logging.getLogger(__name__)
+
+class RateLimiter:
+    def __init__(self, max_concurrent: int = 3):
+        # 3 concurrent requests to Google News — conservative for one IP
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def __aenter__(self):
+        await self.semaphore.acquire()
+        # Jitter AFTER acquiring the slot, so it staggers requests
+        # without holding up other waiters during the sleep
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        return self
+
+    async def __aexit__(self, *args):
+        self.semaphore.release()
+
+rate_limiter = RateLimiter(max_concurrent=3)
 
 class NetworkHandler:
     @staticmethod
-    def get_google_rss(url: str, proxy: Optional[str] = None, use_cache: bool = True) -> Optional[str]:
+    async def get_google_rss(url: str, proxy: Optional[str] = None, use_cache: bool = True) -> Optional[str]:
         """
-        Centralized Google News RSS fetcher with:
-        - Concurrency capping (Semaphore)
-        - Cache (Redis)
-        - Random delays
-        - 503 Detection and Exponential Backoff
+        Refactored Google News RSS fetcher using the new hardware-tuned RateLimiter.
         """
         redis = get_redis_sync()
         cache_key = f"nexus:rss_cache:{hashlib.md5(url.encode()).hexdigest()}"
@@ -81,56 +103,41 @@ class NetworkHandler:
         if use_cache:
             cached = redis.get(cache_key)
             if cached:
-                # logger.info(f"Cache HIT for {url[:50]}...")
                 return cached if isinstance(cached, str) else cached.decode('utf-8')
 
-        # Global Throttle Check: If we see too many 503s globally, cool down
+        # Global Throttle Check
         throttle_count = int(redis.get("nexus:global_503_count") or 0)
         if throttle_count > 5:
-            # logger.warning("Global throttle active. Cooling down for 60s...")
-            time.sleep(60)
+            await asyncio.sleep(60)
             redis.delete("nexus:global_503_count")
 
-        with google_semaphore:
-            # Per-request random delay (Politeness)
-            time.sleep(random.uniform(1.0, 3.0))
-            
+        async with rate_limiter:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "User-Agent": random.choice(USER_AGENTS),
                 "Accept-Language": "en-US,en;q=0.9",
             }
             
-            client_args = {"timeout": 30, "follow_redirects": True}
-            if proxy:
-                client_args["proxy"] = proxy
-
-            attempts = 3
-            backoff = 4
-            
-            for i in range(attempts):
-                try:
-                    with httpx.Client(**client_args) as client:
-                        resp = client.get(url, headers=headers)
+            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, limits=limits, proxy=proxy) as client:
+                attempts = 3
+                for i in range(attempts):
+                    try:
+                        resp = await client.get(url, headers=headers)
                         
                         if resp.status_code == 200:
                             content = resp.text
-                            # Cache successful results for 1 hour
                             redis.setex(cache_key, 3600, content)
                             return content
                         
                         if resp.status_code == 503:
-                            logger.warning(f"Google 503 detected for {url[:50]}... Attempt {i+1}/{attempts}")
+                            logger.warning(f"Google 503 detected. Attempt {i+1}/{attempts}")
                             redis.incrby("nexus:global_503_count", 1)
-                            redis.expire("nexus:global_503_count", 60)
-                            time.sleep(backoff)
-                            backoff *= 2 # Exponential backoff
+                            await asyncio.sleep(5 * (i + 1))
                             continue
                             
                         resp.raise_for_status()
-                except Exception as e:
-                    if i == attempts - 1:
-                        logger.error(f"Failed to fetch Google RSS after {attempts} attempts: {e}")
-                    time.sleep(backoff)
-                    backoff *= 2
-                    
+                    except Exception as e:
+                        if i == attempts - 1:
+                            logger.error(f"Failed RSS fetch: {e}")
+                        await asyncio.sleep(2)
         return None

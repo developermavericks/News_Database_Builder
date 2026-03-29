@@ -132,11 +132,37 @@ def get_domain_name(url: str) -> str:
     except:
         return ""
 
-def extract_metadata_with_ollama_sync(body: str, url: str = "", context_agency: str = "", author_metadata: Dict = None, html_snippets: Dict = None) -> Dict[str, Any]:
+from concurrent.futures import ThreadPoolExecutor
+from config import CURRENT_PROFILE
+
+# Non-blocking executor for LLM calls (RTX 3060 is single-instance per GPU usually)
+_llm_executor = ThreadPoolExecutor(max_workers=CURRENT_PROFILE["OLLAMA_MAX_WORKERS"])
+
+def _call_ollama_blocking(prompt: str) -> str:
+    """Synchronous blocking call to Ollama API."""
+    import requests
+    try:
+        # Use provided model or fallback
+        model = OLLAMA_MODEL
+        if ":" not in model: model = f"{model}:latest"
+        
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["response"]
+    except Exception as e:
+        raise e
+
+async def extract_metadata_with_ollama(body: str, url: str = "", context_agency: str = "", author_metadata: Dict = None, html_snippets: Dict = None) -> Dict[str, Any]:
+    """
+    Non-blocking wrapper for Ollama metadata extraction.
+    """
     if not body or len(body) < 100: return {"author": None, "agency": context_agency or None, "body": body}
     domain = get_domain_name(url) if url else ""
     
-    # State-of-the-Art "Judge" Prompt
     prompt = (
         f"Analyze this news article and extract metadata in JSON format.\n"
         f"Target Fields: author (specific person), handle (social media), agency (news org), is_junk (bool), cleaned_body (text).\n\n"
@@ -145,19 +171,18 @@ def extract_metadata_with_ollama_sync(body: str, url: str = "", context_agency: 
         f"2. Suggested Handle: {author_metadata.get('handle') if author_metadata else 'None'}\n"
         f"3. HTML HEAD SNIPPET: {html_snippets.get('head') if html_snippets else 'None'}\n"
         f"4. BYLINE AREA SNIPPET: {html_snippets.get('top') if html_snippets else 'None'}\n\n"
-        f"TASK: Use the snippets to verify or find the correct author. "
-        f"If the metadata suggestion is generic (like 'Staff'), find the real name in the snippets. "
-        f"If a specific handle is found, use it to confirm the author.\n\n"
+        f"TASK: Use the snippets to verify or find the correct author.\n\n"
         f"Text Sample: {body[:4000]}"
     )
     
+    loop = asyncio.get_running_loop()
     try:
-        client = ollama.Client(host=OLLAMA_BASE_URL)
-        response = client.chat(model=OLLAMA_MODEL, messages=[{'role': 'user', 'content': prompt}], format='json')
-        content = response['message']['content']
+        content = await asyncio.wait_for(
+            loop.run_in_executor(_llm_executor, _call_ollama_blocking, prompt),
+            timeout=65
+        )
         data = json.loads(content)
         
-        # Priority: LLM Extracted > Context (RSS) > Domain Name
         res_agency = data.get("agency")
         if not res_agency or res_agency.lower() in ["google", "google news"]:
              res_agency = context_agency or domain
@@ -170,37 +195,36 @@ def extract_metadata_with_ollama_sync(body: str, url: str = "", context_agency: 
             "cleaned_body": data.get("cleaned_body", body)
         }
     except Exception as e:
-        log(f"Ollama Extraction error: {e}")
+        log(f"[llm] extraction skipped/failed: {e}")
         return {"author": (author_metadata or {}).get("name"), "agency": context_agency or domain, "body": body}
 
 def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, context_agency: str = "", extra_metadata: Dict = None) -> Dict[str, Any]:
-    results = {"summary": None, "author": None, "agency": None, "tags": None, "sentiment": "neutral"}
+    from config import run_async
+    results = {"summary": None, "author": None, "agency": None, "tags": [sector], "sentiment": "neutral"}
     if not body or len(body) < 100: return results
     
     extra_metadata = extra_metadata or {}
     author_metadata = extra_metadata.get("author_metadata")
     html_snippets = extra_metadata.get("html_snippets")
     
-    meta = extract_metadata_with_ollama_sync(
-        body, 
-        url=url, 
-        context_agency=context_agency, 
-        author_metadata=author_metadata,
-        html_snippets=html_snippets
-    )
-    
-    results["author"] = meta.get("author")
-    if meta.get("handle"):
-        results["author"] = f"{results['author']} (@{meta['handle']})" if results["author"] else f"@{meta['handle']}"
-    
-    results["agency"] = meta.get("agency")
-    results["summary"] = summarize_with_groq_sync(body)
-    
-    # Simple sentiment checks (Separate checks to avoid elution)
-    body_low = body.lower()[:1000]
-    if any(w in body_low for w in ["positive", "success", "breakthrough", "growth"]): 
-        results["sentiment"] = "positive"
-    if any(w in body_low for w in ["warning", "risk", "lawsuit", "antitrust", "failure"]): 
-        results["sentiment"] = "negative"
+    # 1. Primary Extraction with Hardware-Tuned Ollama (Bridged)
+    try:
+        meta = run_async(extract_metadata_with_ollama(
+            body, 
+            url=url, 
+            context_agency=context_agency, 
+            author_metadata=author_metadata,
+            html_snippets=html_snippets
+        ))
+        
+        results["author"] = meta.get("author")
+        if meta.get("handle"):
+            results["author"] = f"{results['author']} (@{meta['handle']})" if results["author"] else f"@{meta['handle']}"
+        
+        results["agency"] = meta.get("agency")
+        # Placeholder for summary / sentiment
+        results["summary"] = meta.get("cleaned_body", body)[:1000]
+    except Exception as e:
+        log(f"[llm] Enrichment bridge fail: {e}")
     
     return results
