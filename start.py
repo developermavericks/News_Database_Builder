@@ -67,13 +67,19 @@ def main():
 
     # Load .env variables
     env = os.environ.copy()
-    env_file = os.path.join(backend_dir, ".env")
-    if os.path.exists(env_file):
-        with open(env_file, "r") as f:
-            for line in f:
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    env[k.strip()] = v.strip()
+    def load_env_file(path):
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                for line in f:
+                    if "=" in line and not line.startswith("#"):
+                        # Split by first "=" and take key, value
+                        parts = line.strip().split("=", 1)
+                        if len(parts) == 2:
+                            k, v = parts
+                            env[k.strip()] = v.strip()
+
+    load_env_file(os.path.join(backend_dir, ".env"))
+    load_env_file(os.path.join(backend_dir, ".env.local"))
 
     # 1. Check Dependencies
     if not check_redis():
@@ -103,17 +109,25 @@ def main():
         # Start API
         start_service("Backend API", [python_exe, "run_backend.py"], backend_dir, "api.log")
         
-        # Start Worker (-P solo for 16GB to allow asyncio concurrency without gevent conflicts)
-        # For 64GB, solo is also preferred to leverage the new async engine efficiency.
+        # Determine Hardware profile and pool type
         hw_profile = env.get("HARDWARE_PROFILE", "16GB")
-        pool_type = "solo"
         
-        logger.info(f"Starting Celery Worker with {pool_type} pool ({hw_profile} profile)...")
-        start_service("Celery Worker", [
+        # Windows-specific pool: 'threads' is safer and supports concurrency better than solo or gevent
+        pool_type = env.get("CELERY_POOL", "threads" if hw_profile == "64GB" else "solo")
+        concurrency = env.get("CELERY_WORKER_CONCURRENCY", "16" if hw_profile == "64GB" else "10")
+        
+        logger.info(f"Starting Celery Worker with {pool_type} pool ({hw_profile} profile, concurrency={concurrency})...")
+        
+        worker_cmd = [
             python_exe, "-m", "celery", "-A", "celery_app", "worker", 
             "--loglevel=info", "-P", pool_type,
             "--prefetch-multiplier=1"
-        ], backend_dir, "worker.log")
+        ]
+        
+        if pool_type != "solo":
+            worker_cmd.extend(["--concurrency", str(concurrency)])
+            
+        start_service("Celery Worker", worker_cmd, backend_dir, "worker.log")
         
         # Start Beat (Scheduler)
         start_service("Celery Beat", [python_exe, "-m", "celery", "-A", "celery_app", "beat", "--loglevel=info"], backend_dir, "beat.log")

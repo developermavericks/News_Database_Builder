@@ -23,13 +23,13 @@ PROFILES = {
         "WORKER_MAX_MEMORY": 400_000,  # 400MB (in KB for Celery)
     },
     "64GB": {
-        "CELERY_CONCURRENCY": 50,
+        "CELERY_CONCURRENCY": 32,
         "DB_POOL_SIZE": 20,
         "DB_MAX_OVERFLOW": 30,
         "BROWSER_POOL_SIZE": 10,
         "OLLAMA_MAX_WORKERS": 4,
-        "TASK_TIME_LIMIT": 300,        # 5 minutes
-        "TASK_SOFT_TIME_LIMIT": 240,   # 4 minutes
+        "TASK_TIME_LIMIT": 1800,        # 30 minutes
+        "TASK_SOFT_TIME_LIMIT": 1500,   # 25 minutes
         "WORKER_MAX_MEMORY": 1_000_000, # 1GB
     }
 }

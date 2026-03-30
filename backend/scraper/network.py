@@ -39,7 +39,7 @@ class ProxyGuard:
 def load_proxies():
     proxies = []
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for fname in ["Webshare 10 proxies.txt", "webshare_proxies.txt"]:
+    for fname in ["Webshare residential proxies.txt", "Webshare 10 proxies.txt", "webshare_proxies.txt"]:
         fpath = os.path.join(base_dir, fname)
         if os.path.exists(fpath):
             with open(fpath, "r") as f:

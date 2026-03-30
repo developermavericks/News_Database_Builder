@@ -57,6 +57,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
     from scraper.engine import scrape_only, is_job_cancelled
     from scraper.google_news import resolve_google_news_url_sync
     from scraper.llm import get_redis_sync
+    from scraper.network import load_proxies, ProxyGuard
     
     try:
         if is_job_cancelled(job_id):
@@ -84,13 +85,20 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
         
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
+            
+            # --- Proxy Rotation ---
+            proxy_pool = load_proxies()
+            proxy = ProxyGuard.get_healthy_proxy(proxy_pool) if proxy_pool else None
+            
             # Use connection pooling via httpx.Client
-            with httpx.Client(timeout=timeout, follow_redirects=True, limits=httpx.Limits(max_connections=10)) as client:
+            with httpx.Client(timeout=timeout, follow_redirects=True, limits=httpx.Limits(max_connections=10), proxy=proxy) as client:
                 resp = client.get(resolved_url, headers=headers)
                 if resp.status_code == 200:
                     text_content = trafilatura.extract(resp.text)
                     if text_content and len(text_content) > 400:
                         html = resp.text
+                elif resp.status_code in [403, 429, 503] and proxy:
+                    ProxyGuard.mark_unhealthy(proxy)
         except Exception as e:
             logger.debug(f"Fast-track failed for {resolved_url}: {e}")
 
@@ -108,7 +116,9 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
         article_data["resolved_url"] = resolved_url
         article_data["raw_html"] = html
 
+        # scrape_only internally handles _mark_article_processed for all success/fail paths
         article_id = run_async(scrape_only(article_data, job_id, sector, region, user_id))
+        
         if article_id:
             # Mark as processed in Redis for O(1) deduplication in future discovery
             redis = get_redis_sync()
@@ -117,8 +127,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             
             logger.info(f"Scraped article {article_id}. Triggering enrichment...")
             enrich_article_node.delay(article_id)
-        else:
-            _mark_article_processed(job_id)
+        # Note: If article_id is None, scrape_only has already called _mark_article_processed
 
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
