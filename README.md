@@ -1,27 +1,23 @@
 # ⬡ NEXUS — Global News Intelligence Scraper
 
-A full-stack web application for scraping, storing, and browsing news articles globally by sector, region, and date range.
+NEXUS is a high-performance, enterprise-grade news intelligence system designed for large-scale news discovery, extraction, and AI-powered analysis. It is optimized for high-RAM environments (64GB+) and features a distributed architecture using FastAPI, Celery, Redis, and PostgreSQL.
 
 ---
 
-## 🚀 Quick Start (Single Command)
+## 🚀 Quick Start (Single Command Launch)
+
+Connect to your hardware's full power with a single command. 
 
 ### Prerequisites
-
-- **Python 3.10+** with `venv`
-- **Node.js 18+** with `npm`
-- **Playwright Chromium** browser (`playwright install chromium`)
+- **Python 3.10+** (with `backend/venv` created)
+- **Node.js 18+**
+- **Docker Desktop** (Required for Redis/Postgres)
+- **Playwright Chromium** (`playwright install chromium`)
 
 ### Run the Application
-
 ```powershell
-# Windows PowerShell — starts both backend + frontend
-.\start.ps1
-```
-
-```cmd
-# Windows CMD alternative
-start.bat
+# Optimized local stack bootstrapper
+python start.py
 ```
 
 This single command will:
@@ -60,34 +56,18 @@ cd ..
 
 ---
 
-## 🏗 Architecture
+## 📁 System Documentation
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                         NEXUS                                │
-│                                                              │
-│  React Frontend (Vite :5173)                                 │
-│    ├── Dashboard     — stats, body coverage, quick actions   │
-│    ├── New Scrape    — configure & launch jobs               │
-│    ├── Articles      — browse, filter, search, export CSV    │
-│    └── Jobs          — live monitoring, error visibility     │
-│                          │ Vite Proxy (/api → :8000)         │
-│  FastAPI Backend (:8000)                                     │
-│    ├── /api/scrape   — trigger & monitor scrape jobs         │
-│    ├── /api/articles — query, filter, export                 │
-│    └── Startup       — auto-recovery of interrupted jobs     │
-│                          │                                   │
-│  Scraper Engine (Playwright + BeautifulSoup)                 │
-│    ├── Google News + Bing News RSS discovery                 │
-│    ├── Direct headless Chromium scraping (fast)               │
-│    └── Paywall bypass enrichment (deferred, on-demand)       │
-│                          │                                   │
-│  SQLite Database (auto-migrating schema)                     │
-│    ├── articles      — all scraped article data              │
-│    ├── scrape_jobs   — job tracking & progress               │
-│    └── articles_fts  — full-text search index                │
-└──────────────────────────────────────────────────────────────┘
-```
+For a deep dive into the engineering behind NEXUS, including API schemas, task queue logic, and hardware thread pools, see:
+👉 **[SYSTEM_ARCHITECTURE.md](./SYSTEM_ARCHITECTURE.md)**
+
+---
+
+## 🏗 Architecture Overview
+
+NEXUS uses a **Hybrid Execution Model**:
+*   **Infrastructure**: Redis and PostgreSQL run in **Docker** for reliability.
+*   **App Logic**: Backend API and Celery Workers run **Natively** for maximum performance.
 
 ---
 
