@@ -41,7 +41,14 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
 
 # ─── Scraper Node (I/O Intensive) ─────────────────────────────────────────────
 
-@celery_app.task(name="scraper.tasks.scrape_article_node", bind=True, rate_limit="100/m", max_retries=2, default_retry_delay=5)
+@celery_app.task(
+    bind=True, 
+    max_retries=5, 
+    default_retry_delay=10, 
+    retry_backoff=True,
+    retry_backoff_max=300,
+    rate_limit="200/m"
+)
 def scrape_article_node(self, article_data, job_id, sector, region, user_id, scaling_mode=False):
     """
     Task Node 1: Fetches HTML and extracts raw body. 

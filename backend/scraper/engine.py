@@ -31,27 +31,45 @@ from scraper.config import SECTOR_KEYWORDS, REGION_MAP, SEARCH_MODIFIERS, USER_A
 
 # --- Logging ---
 import logging
+import json
+
 class JsonFormatter(logging.Formatter):
+    def _mask_pii(self, msg):
+        if not isinstance(msg, str): return msg
+        # Patterns to mask
+        patterns = [
+            (r'(?i)(password["\':\s]+)[^"\'\s,]+', r'\1********'),
+            (r'(?i)(Authorization["\':\s]+Bearer\s+)[^"\'\s,]+', r'\1********'),
+            (r'(?i)(hashed_password["\':\s]+)[^"\'\s,]+', r'\1********')
+        ]
+        import re
+        for pat, repl in patterns:
+            msg = re.sub(pat, repl, msg)
+        return msg
+
     def format(self, record):
         log_entry = {
-            "time": self.formatTime(record, self.datefmt),
+            "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
-            "msg": record.getMessage(),
-            "logger": record.name
+            "message": self._mask_pii(record.getMessage()),
+            "module": record.module,
+            "job_id": getattr(record, "job_id", "SYSTEM")
         }
-        if record.exc_info:
-            log_entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_entry)
 
-handler = logging.StreamHandler(sys.stderr)
-handler.setFormatter(JsonFormatter())
+# Initialize handler safely
+_handler = logging.StreamHandler()
+_handler.setFormatter(JsonFormatter())
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[handler]
+    handlers=[_handler]
 )
 
 logger = logging.getLogger("ENGINE")
+
+def log(msg, job_id="SYSTEM"):
+    logger.info(msg, extra={"job_id": job_id})
 
 # --- Exceptions ---
 class NexusBaseError(Exception): pass
@@ -60,9 +78,6 @@ class RateLimitError(NexusBaseError): pass
 class ArticleFetchError(NexusBaseError): pass
 
 from scraper.network import NetworkHandler, ProxyGuard, load_proxies
-
-def log(msg: str):
-    logger.info(msg)
 
 def random_ua() -> str:
     return random.choice(USER_AGENTS)
@@ -114,6 +129,7 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
                 return
 
             feed = feedparser.parse(xml_content)
+            found_this_q = 0
             for entry in feed.entries:
                 link = entry.link
                 if link not in seen_urls and (cumulative is None or link not in cumulative):
@@ -132,8 +148,12 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
 
                     articles.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
                     seen_urls.add(link)
+                    found_this_q += 1
+            
+            if found_this_q > 0:
+                log(f"Discovery: Found {found_this_q} articles for keyword '{q}'", job_id=job_id)
         except Exception as exc:
-            log(f"Discovery fail for '{q}': {exc}")
+            log(f"Discovery fail for '{q}': {exc}", job_id=job_id)
 
     search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
     with get_db_sync() as db:
@@ -144,20 +164,21 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
     window_queries = [kw for kw in keywords]
     if not is_brand_tracker:
         for kw in keywords:
-            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)): 
+            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 3)): 
                 window_queries.append(f"{kw} {mod}")
     
     random.shuffle(window_queries)
     
-    # Discovery Acceleration: Use asyncio.gather for non-blocking I/O
     tasks = []
     for lang in search_languages:
         for q in window_queries:
             tasks.append(fetch_rss(q, hl=lang['code'], ceid=lang['ceid']))
     
+    log(f"Discovery mission started for {len(window_queries)} keywords for day {day}", job_id=job_id)
     await asyncio.gather(*tasks)
 
     if cumulative is not None: cumulative.update(seen_urls)
+    log(f"Discovery for {day} completed. Total found: {len(articles)}", job_id=job_id)
     return articles
 
 # ─── High-Throughput Discovery (Scaling Strategy) ───

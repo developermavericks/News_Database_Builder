@@ -38,7 +38,7 @@ def clean_author_text(text: Optional[str]) -> Optional[str]:
     return text
 
 def is_junk_body(body: Optional[str], brand_keywords: List[str] = None) -> bool:
-    if not body or len(body.strip()) < 100: return True
+    if not body or len(body.strip()) < 50: return True
     
     body_lower = body.lower()
     # Brand Tracker Override: If the brand is mentioned, ignore noisy junk patterns
@@ -49,7 +49,7 @@ def is_junk_body(body: Optional[str], brand_keywords: List[str] = None) -> bool:
             return False
 
     word_count = len(body.split())
-    if word_count < 80: return True
+    if word_count < 30: return True
     return any(pat in body_lower for pat in JUNK_PATTERNS)
 
 def extract_author_v2(html: str) -> Dict[str, Any]:
@@ -183,7 +183,7 @@ def extract_body(html: str) -> str:
     # 1. Trafilatura bare extraction
     try:
         res = trafilatura.bare_extraction(html)
-        if res and res.get('text') and len(res.get('text')) > 400:
+        if res and res.get('text') and len(res.get('text')) > 150:
             return res.get('text')
     except Exception as e:
         logger.debug(f"Trafilatura bare extraction failed: {e}")
@@ -199,7 +199,7 @@ def extract_body(html: str) -> str:
                     if not isinstance(item, dict): continue
                     if item.get("@type") in ["Article", "NewsArticle", "BlogPosting"]:
                         body = item.get("articleBody")
-                        if body and len(body) > 400: return body
+                        if body and len(body) > 150: return body
             except:
                 continue
     except Exception as e:
@@ -208,7 +208,7 @@ def extract_body(html: str) -> str:
     # 3. Trafilatura standard
     try:
         ext = trafilatura.extract(html, include_comments=False, no_fallback=False)
-        if ext and len(ext) > 400: return ext
+        if ext and len(ext) > 150: return ext
     except Exception as e:
         logger.debug(f"Trafilatura standard extraction failed: {e}")
 

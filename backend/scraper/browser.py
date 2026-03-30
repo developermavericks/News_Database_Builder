@@ -82,8 +82,14 @@ async def scrape_url(url: str, timeout: int = 30000) -> str | None:
     try:
         async with browser_pool.acquire_page() as page:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            # Subtle delay to ensure JS heavy sites settle
-            await asyncio.sleep(1)
+            # Wait for content to stabilize
+            await page.wait_for_timeout(1000)
+            
+            # --- High-Yield Tuning: Automated Scroll ---
+            # Triggers "Lazy Loading" on many modern news sites
+            await page.mouse.wheel(0, 500)
+            await page.wait_for_timeout(500)
+            
             return await page.content()
     except Exception as e:
         logger.error(f"Pool scraper error for {url}: {str(e)}")
