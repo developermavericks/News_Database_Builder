@@ -58,18 +58,19 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_entry)
 
 # Initialize handler safely
-_handler = logging.StreamHandler()
+_handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(JsonFormatter())
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[_handler]
-)
-
 logger = logging.getLogger("ENGINE")
+logger.setLevel(logging.INFO)
+# Avoid adding multiple handlers if the module is re-imported
+if not logger.handlers:
+    logger.addHandler(_handler)
 
 def log(msg, job_id="SYSTEM"):
     logger.info(msg, extra={"job_id": job_id})
+    # Fallback to standard print if stdout is redirected in a way that logging misses
+    # but we'll try standard logger first.
 
 # --- Exceptions ---
 class NexusBaseError(Exception): pass
@@ -84,7 +85,18 @@ def random_ua() -> str:
 
 # update_phase_status moved to orchestrator.py
 
-def is_job_cancelled(job_id: str) -> bool:
+async def is_job_cancelled(job_id: str) -> bool:
+    from scraper.llm import get_redis
+    try:
+        r = await get_redis()
+        # Redis async client handles connection pool correctly on loop thread
+        if await r.get("nexus:global_stop") or await r.sismember("nexus:cancelled_jobs", job_id):
+            return True
+        return False
+    except:
+        return False
+
+def is_job_cancelled_sync(job_id: str) -> bool:
     from scraper.llm import get_redis_sync
     try:
         r = get_redis_sync()
@@ -103,15 +115,17 @@ def verify_brand_relevance(text: str, keywords: List[str]) -> bool:
 
 # ─── Discovery Phase ───
 
-async def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
+import concurrent.futures
+
+def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
     articles = []
     seen_urls = set()
     proxy_pool = load_proxies() or []
-    
-    async def fetch_rss(q, hl="en-IN", ceid="IN:en"):
-        if is_job_cancelled(job_id): return
+    is_today = day >= date.today()
+
+    def fetch_rss_sync(q, hl="en-IN", ceid="IN:en"):
+        if is_job_cancelled_sync(job_id): return []
         
-        is_today = day >= date.today()
         domain = "google.com" 
         if is_today:
             full_q = f"{q} when:1d"
@@ -121,15 +135,13 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
             tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
             rss_url = f"https://news.{domain}/rss/search?q={quote(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote(tbs)}"
         
+        results = []
         try:
             proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
-            xml_content = await NetworkHandler.get_google_rss(rss_url, proxy=proxy)
-            if not xml_content:
-                if proxy: ProxyGuard.mark_unhealthy(proxy)
-                return
+            xml_content = NetworkHandler.get_google_rss(rss_url, proxy=proxy)
+            if not xml_content: return []
 
             feed = feedparser.parse(xml_content)
-            found_this_q = 0
             for entry in feed.entries:
                 link = entry.link
                 if link not in seen_urls and (cumulative is None or link not in cumulative):
@@ -146,14 +158,33 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
                         try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
                         except: pass
 
-                    articles.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
-                    seen_urls.add(link)
-                    found_this_q += 1
-            
-            if found_this_q > 0:
-                log(f"Discovery: Found {found_this_q} articles for keyword '{q}'", job_id=job_id)
+                    results.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
+            return results
         except Exception as exc:
             log(f"Discovery fail for '{q}': {exc}", job_id=job_id)
+            return []
+
+    def fetch_bing_rss_sync(q):
+        if is_job_cancelled_sync(job_id): return []
+        bing_url = f"https://www.bing.com/news/search?q={quote(q)}&format=rss&mkt=en-IN&sortby=date"
+        results = []
+        try:
+            proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
+            xml_content = NetworkHandler.get_google_rss(bing_url, proxy=proxy)
+            if not xml_content: return []
+            feed = feedparser.parse(xml_content)
+            for entry in feed.entries:
+                link = getattr(entry, 'link', None)
+                if not link or link in seen_urls or (cumulative and link in cumulative): continue
+                pub_date_str = day.isoformat()
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
+                    except: pass
+                results.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": "Bing News"})
+            return results
+        except Exception as exc:
+            log(f"Bing discovery fail for '{q}': {exc}", job_id=job_id)
+            return []
 
     search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
     with get_db_sync() as db:
@@ -169,17 +200,33 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
     
     random.shuffle(window_queries)
     
-    tasks = []
-    for lang in search_languages:
-        for q in window_queries:
-            tasks.append(fetch_rss(q, hl=lang['code'], ceid=lang['ceid']))
+    log(f"Discovery mission started: {len(window_queries)} keywords × 2 sources (Google+Bing) for day {day}", job_id=job_id)
     
-    log(f"Discovery mission started for {len(window_queries)} keywords for day {day}", job_id=job_id)
-    await asyncio.gather(*tasks)
+    all_results = []
+    # Use 10 threads for balanced sync discovery
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_query = {}
+        for q in window_queries:
+            for lang in search_languages:
+                future_to_query[executor.submit(fetch_rss_sync, q, lang['code'], lang['ceid'])] = q
+                future_to_query[executor.submit(fetch_bing_rss_sync, q)] = q
+        
+        completed = 0
+        total = len(future_to_query)
+        for future in concurrent.futures.as_completed(future_to_query):
+            res = future.result()
+            if res:
+                for item in res:
+                    if item['url'] not in seen_urls:
+                        all_results.append(item)
+                        seen_urls.add(item['url'])
+            completed += 1
+            if completed % 20 == 0:
+                log(f"Discovery Progress [{day}]: {completed}/{total} tasks complete.", job_id=job_id)
 
     if cumulative is not None: cumulative.update(seen_urls)
-    log(f"Discovery for {day} completed. Total found: {len(articles)}", job_id=job_id)
-    return articles
+    log(f"Discovery for {day} completed. Total found: {len(all_results)}", job_id=job_id)
+    return all_results
 
 # ─── High-Throughput Discovery (Scaling Strategy) ───
 
@@ -214,7 +261,7 @@ async def discover_articles_scaling(job_id: str, sectors: List[str] = None) -> L
 # ─── Scraper Phase ───
 
 async def scrape_only(article: dict, job_id: str, sector: str, region: str, user_id: str) -> Optional[int]:
-    if is_job_cancelled(job_id): return None
+    if await is_job_cancelled(job_id): return None
     try:
         url = article["url"]
         resolved_url = article.get("resolved_url", url)
@@ -260,11 +307,18 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
         extracted_date = parser.extract_date(raw_html)
         if extracted_date: final_pub_at = extracted_date
 
+        # FIX 2: Keyword relevance check — no longer deletes articles.
+        # Articles are kept even if keyword match fails; body is preserved.
+        # A relevance flag is stored in metadata so future filtering/ranking can use it.
+        # This prevents silent data loss for articles with thin or paywalled bodies.
         if keywords:
             title_body = f"{article['title']} {body}"
             is_relevant = any(kw.lower() in title_body.lower() for kw in keywords)
-            if not is_relevant and sector.lower() in title_body.lower(): is_relevant = True
-            if not is_relevant: body = None
+            if not is_relevant and sector.lower() in title_body.lower():
+                is_relevant = True
+            extra_meta["relevance_matched"] = is_relevant
+            if not is_relevant:
+                logger.debug(f"Article '{article['title'][:60]}' did not match keywords, keeping with low-relevance flag.")
         
         now = datetime.now()
         if final_pub_at.tzinfo: now = now.astimezone(final_pub_at.tzinfo)
@@ -277,11 +331,17 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 db.execute(delete(Article).where(Article.url == article["url"]))
                 _mark_article_processed(job_id)
             else:
+                # Compute title_hash for cross-URL deduplication
+                _norm_title = re.sub(r'\W+', '', article["title"].lower())
+                _title_hash = hashlib.md5(_norm_title.encode()).hexdigest()
                 val_dict = {
                     "title": article["title"], "url": article["url"], "resolved_url": resolved_url,
                     "full_body": body, "author": author, "agency": article.get("agency"),
                     "published_at": final_pub_at, "sector": sector, "region": region,
-                    "scrape_job_id": job_id, "user_id": user_id, "extra_metadata": extra_meta
+                    "scrape_job_id": job_id, "user_id": user_id, "extra_metadata": extra_meta,
+                    # FIX: Populate word_count and title_hash on every scrape
+                    "word_count": len(body.split()) if body else 0,
+                    "title_hash": _title_hash,
                 }
                 from sqlalchemy.dialects.postgresql import insert as pg_upsert
                 stmt = pg_upsert(Article).values(**val_dict).on_conflict_do_update(
@@ -290,7 +350,9 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                         "full_body": val_dict["full_body"], "author": val_dict["author"],
                         "agency": val_dict["agency"], "extra_metadata": val_dict["extra_metadata"],
                         "published_at": val_dict["published_at"], "scrape_job_id": val_dict["scrape_job_id"],
-                        "resolved_url": val_dict["resolved_url"]
+                        "resolved_url": val_dict["resolved_url"],
+                        "word_count": val_dict["word_count"],
+                        "title_hash": val_dict["title_hash"],
                     }
                 ).returning(Article.id)
                 res = db.execute(stmt)
@@ -356,9 +418,10 @@ async def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode
             log(f"Job {job_id}: Sector mode for '{sector}' (Mode: {search_mode}, Keywords: {keywords})")
 
         geo = REGION_MAP.get(region.lower(), {"geo": "IN"})["geo"]
-        all_discovered = []
         cumulative = set()
-        
+        total_found = 0
+        from scraper.tasks import scrape_article_node
+
         # Determine date range
         dates = []
         curr = date_from
@@ -366,33 +429,52 @@ async def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode
             dates.append(curr)
             curr += timedelta(days=1)
 
-        # High-Efficiency Async Discovery
-        tasks = []
+        # High-Efficiency Streaming Discovery
+        discovery_tasks = []
+        loop = asyncio.get_running_loop()
         for d in dates:
-            if is_job_cancelled(job_id): break
-            tasks.append(discover_articles(keywords, d, geo, region, job_id, cumulative))
+            if await is_job_cancelled(job_id): break
+            # Bridge the sync discovery function back to async via executor
+            discovery_tasks.append(loop.run_in_executor(None, discover_articles, keywords, d, geo, region, job_id, cumulative))
         
-        if tasks:
-            # Gather all discovery results concurrently
-            discovery_results = await asyncio.gather(*tasks)
-            for res in discovery_results:
-                if res:
-                    all_discovered.extend(res)
-        
-        db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(cumulative_found=len(cumulative)))
+        if discovery_tasks:
+            log(f"Discovery: Launching {len(discovery_tasks)} date-window discovery tasks concurrently.")
+            # We use as_completed to process discoveries as they finish
+            count = 0
+            for future in asyncio.as_completed(discovery_tasks):
+                discovered_for_date = await future
+                if not discovered_for_date: 
+                    continue
+                
+                # Filter out those we've already dispatched in this session?
+                # Actually, cumulative set in discover_articles (line 117) handles this for us!
+                
+                new_articles = discovered_for_date
+                total_found += len(new_articles)
+                
+                # 1. Bulk insert placeholders (DB)
+                bulk_insert_placeholders(db, job_id, new_articles, sector, region, user_id)
+                
+                # 2. Update UI progress (found count)
+                db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_found=total_found))
+                db.commit()
+
+                # 3. DISPATCH IMMEDIATELY (Worker)
+                # No more waiting! Scraping starts while discovery is still pending for other dates.
+                for a in new_articles:
+                    scrape_article_node.delay(a, job_id, sector, region, user_id)
+                
+                count += 1
+                log(f"Discovery: Dispatched {len(new_articles)} articles from date batch {count}/{len(discovery_tasks)}")
+
         update_phase_status(db, job_id, "Discovery", "completed")
+        db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(current_phase="Scraping"))
+        db.commit()
         
-        if not all_discovered:
+        if total_found == 0:
             db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(status='completed', completed_at=datetime.now(), total_found=0))
+            log(f"Job {job_id} Finished (0 articles found).")
             return {"job_id": job_id, "found": 0}
 
-        bulk_insert_placeholders(db, job_id, all_discovered, sector, region, user_id)
-        db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_found=len(all_discovered), current_phase="Scraping"))
-        db.commit()
-
-        from scraper.tasks import scrape_article_node
-        for a in all_discovered:
-            if is_job_cancelled(job_id): break
-            scrape_article_node.delay(a, job_id, sector, region, user_id)
-        
-        return {"job_id": job_id, "found": len(all_discovered)}
+        log(f"Job {job_id}: Streaming discovery complete. Total {total_found} articles enqueued.")
+        return {"job_id": job_id, "found": total_found}

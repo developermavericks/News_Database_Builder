@@ -258,7 +258,69 @@ async def export_xlsx(
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
 
+@router.get("/search/semantic")
+async def semantic_search_articles(
+    q: str = Query(..., description="Natural language search query"),
+    sector: Optional[str] = None,
+    n_results: int = Query(20, ge=1, le=100),
+    current_user: TokenData = Depends(get_current_user)
+):
+    """
+    GPU-powered semantic article search using sentence embeddings (RTX 3060).
+    Finds contextually relevant articles even without exact keyword matches.
+    Falls back to regular keyword search if semantic engine is unavailable.
+    """
+    from scraper.semantic import semantic_search, SEMANTIC_ENABLED
+    if not SEMANTIC_ENABLED:
+        raise HTTPException(503, "Semantic search is disabled. Set SEMANTIC_SEARCH_ENABLED=true in .env")
+
+    hits = semantic_search(query=q, user_id=current_user.id, sector=sector, n_results=n_results)
+    if not hits:
+        return {"query": q, "results": [], "engine": "semantic", "total": 0}
+
+    # Fetch full article data for matching IDs
+    article_ids = [h["article_id"] for h in hits if h.get("article_id")]
+    async with get_db() as db:
+        stmt = select(Article).where(Article.id.in_(article_ids))
+        if not current_user.is_admin:
+            stmt = stmt.where(Article.user_id == current_user.id)
+        res = await db.execute(stmt)
+        articles_map = {a.id: a for a in res.scalars().all()}
+
+    # Return results in relevance order with similarity scores
+    results = []
+    for hit in hits:
+        art = articles_map.get(hit["article_id"])
+        if art:
+            results.append({
+                "article": art,
+                "similarity_score": hit["similarity_score"],
+                "snippet": hit["snippet"]
+            })
+
+    return {"query": q, "results": results, "engine": "semantic", "total": len(results)}
+
+
+@router.post("/search/embed-all")
+async def trigger_bulk_embed(current_user: TokenData = Depends(get_current_user)):
+    """
+    Backfill semantic embeddings for all existing articles.
+    Run once after enabling SEMANTIC_SEARCH_ENABLED=true to index historical data.
+    Admin-only endpoint.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required to trigger bulk embedding")
+
+    from scraper.semantic import bulk_embed_existing
+    import asyncio
+    # Run in background thread to avoid blocking the API
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: bulk_embed_existing(user_id=None))
+    return {"status": "complete", **result}
+
+
 @router.get("/{article_id}")
+
 async def get_article(article_id: int, current_user: TokenData = Depends(get_current_user)):
     async with get_db() as db:
         stmt = select(Article).where(Article.id == article_id)

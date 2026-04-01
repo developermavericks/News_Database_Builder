@@ -46,6 +46,7 @@ app.conf.update(
     result_serializer="json",
     timezone="Asia/Kolkata",
     enable_utc=True,
+    result_expires=86400,  # FIX: Prevent Redis Mem Leaks (ttl: 24h)
     task_soft_time_limit=CURRENT_PROFILE["TASK_SOFT_TIME_LIMIT"],
     task_time_limit=CURRENT_PROFILE["TASK_TIME_LIMIT"],
     # Hardware-tuned limits
@@ -55,9 +56,9 @@ app.conf.update(
     task_acks_late=True,           
     task_reject_on_worker_lost=True, 
     task_routes={
-        "scraper.tasks.run_scrape_task": {"queue": "celery"},
-        "scraper.tasks.scrape_article_node": {"queue": "celery"},
-        "scraper.tasks.enrich_article_node": {"queue": "celery"},
+        "scraper.tasks.run_scrape_task": {"queue": "scrape"},
+        "scraper.tasks.scrape_article_node": {"queue": "scrape"},
+        "scraper.tasks.enrich_article_node": {"queue": "enrich"},
         "scraper.tasks.complete_stale_jobs": {"queue": "celery"},
     },
     beat_schedule={

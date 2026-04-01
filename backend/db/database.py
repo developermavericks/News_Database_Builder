@@ -50,7 +50,27 @@ elif "sqlite" not in get_database_url():
         "pool_pre_ping": True,
     })
 
-async_connect_args = {"timeout": 60} if "sqlite" in get_database_url() else {"command_timeout": 60}
+async_connect_args = {"timeout": 60}
+if "sqlite" in get_database_url():
+    # Performance tuning: Write-Ahead Logging for high concurrency, normal sync for speed
+    async_connect_args.update({
+        "timeout": 60,
+        "isolation_level": None,  # Enables auto-commit mode needed for pragmas
+    })
+    
+    from sqlalchemy import event
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA mmap_size=30000000000")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+else:
+    async_connect_args = {"command_timeout": 60}
+
 engine = create_async_engine(get_database_url(), connect_args=async_connect_args, **engine_args)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -103,7 +123,7 @@ class Article(Base):
     title_hash: Mapped[Optional[str]] = mapped_column(String, index=True)
     
     # Industrial-grade Metadata Storage (Agnostic JSON)
-    extra_metadata: Mapped[dict] = mapped_column(JSON, default={}, nullable=False)
+    extra_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     __table_args__ = (
         Index("idx_articles_sector", "sector"),

@@ -1,8 +1,8 @@
 @echo off
-title NEXUS Single-Command Startup
+title NEXUS Global News Intelligence
 echo ==============================================
-echo   NEXUS Global News Intelligence Launcher
+echo   NEXUS - High Performance News Orchestrator
 echo ==============================================
 echo.
-powershell -ExecutionPolicy Bypass -Command "& { if (Test-Path 'start.py') { python start.py } else { Write-Host 'Error: start.py not found in current directory.' -ForegroundColor Red } }"
+python start.py
 pause

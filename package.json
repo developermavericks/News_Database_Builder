@@ -1,0 +1,14 @@
+{
+  "name": "nexus-monorepo",
+  "version": "1.0.0",
+  "description": "NEXUS Global News Intelligence System",
+  "scripts": {
+    "start": "python start.py",
+    "setup": "powershell -ExecutionPolicy Bypass -File ./setup_local.ps1",
+    "clean": "python -c \"import os; [os.remove(f) for f in ['api.log', 'worker.log', 'beat.log', 'frontend.log'] if os.path.exists(f)]\"",
+    "stop": "taskkill /F /T /IM python.exe /IM npx.cmd /IM node.exe"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

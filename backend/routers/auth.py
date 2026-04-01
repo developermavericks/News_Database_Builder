@@ -62,24 +62,14 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     res = await db.execute(stmt)
     user = res.scalar_one_or_none()
     
-    # Admin Check via Environment Variables
-    is_admin = False
+    # C2 REVERT: Plaintext admin password check
     admin_email = os.getenv("ADMIN_EMAIL")
     admin_password = os.getenv("ADMIN_PASSWORD")
+    is_hardcoded_admin = False
     
-    if admin_email and admin_password:
-        if form_data.username == admin_email and form_data.password == admin_password:
-            is_admin = True
-            if not user:
-                user_id = "admin-" + str(uuid.uuid4())[:8]
-                user = User(id=user_id, email=admin_email, name="System Admin", is_admin=True)
-                db.add(user)
-                await db.commit()
-            else:
-                user.is_admin = True
-                await db.commit()
-    
-    if not is_admin:
+    if admin_email and admin_password and form_data.username == admin_email and form_data.password == admin_password:
+        is_hardcoded_admin = True
+    else:
         if not user or not user.hashed_password or not verify_password(form_data.password, user.hashed_password):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,14 +77,19 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
                 headers={"WWW-Authenticate": "Bearer"},
             )
     
-    access_token = create_access_token(data={"sub": user.email, "user_id": user.id, "is_admin": is_admin})
-    refresh_token = create_refresh_token(data={"sub": user.email, "user_id": user.id, "is_admin": is_admin})
+    # Ensure they have admin status if they match the admin email
+    if is_hardcoded_admin or (admin_email and user and user.email == admin_email and not user.is_admin):
+        user.is_admin = True
+        await db.commit()
+
+    access_token = create_access_token(data={"sub": user.email, "user_id": user.id, "is_admin": user.is_admin})
+    refresh_token = create_refresh_token(data={"sub": user.email, "user_id": user.id, "is_admin": user.is_admin})
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "user": {"email": user.email, "name": user.name, "is_admin": is_admin}
+        "user": {"email": user.email, "name": user.name, "is_admin": user.is_admin}
     }
 
 @router.get("/google")
@@ -108,19 +103,18 @@ async def google_login(request: Request):
 
 @router.get("/google/callback")
 async def google_callback(request: Request, db: AsyncSession = Depends(get_db_yield)):
+    from fastapi.responses import RedirectResponse
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    
     # Handle cases where Google returns an error (e.g. access_denied)
     error_param = request.query_params.get('error')
     if error_param:
-        from fastapi.responses import RedirectResponse
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        return RedirectResponse(url=f"{frontend_url}/login#error={error_param}")
+        return RedirectResponse(url=f"{frontend_url}/login?error={error_param}")
 
     try:
         token = await oauth.google.authorize_access_token(request)
     except Exception as e:
-        from fastapi.responses import RedirectResponse
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        return RedirectResponse(url=f"{frontend_url}/login#error=auth_failed")
+        return RedirectResponse(url=f"{frontend_url}/login?error=auth_failed")
 
     user_info = token.get('userinfo')
     if not user_info:
@@ -147,19 +141,14 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db_yi
         await db.commit()
     
     # Admin Check via Environment Variables
-    is_admin = False
     admin_email = os.getenv("ADMIN_EMAIL")
     if admin_email and email == admin_email:
-        is_admin = True
         if not user.is_admin:
             user.is_admin = True
             await db.commit()
     
-    access_token = create_access_token(data={"sub": user.email, "user_id": user.id, "is_admin": is_admin})
-    refresh_token = create_refresh_token(data={"sub": user.email, "user_id": user.id, "is_admin": is_admin})
-    
-    from fastapi.responses import RedirectResponse
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    # C3 REVERT: Return token in URL fragment
+    access_token = create_access_token(data={"sub": user.email, "user_id": user.id, "is_admin": user.is_admin})
     return RedirectResponse(url=f"{frontend_url}/login#token={access_token}")
 
 @router.get("/me")

@@ -54,13 +54,13 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
     Task Node 1: Fetches HTML and extracts raw body. 
     Optimized for 2.3 articles/sec in scaling mode.
     """
-    from scraper.engine import scrape_only, is_job_cancelled
+    from scraper.engine import scrape_only, is_job_cancelled_sync
     from scraper.google_news import resolve_google_news_url_sync
     from scraper.llm import get_redis_sync
     from scraper.network import load_proxies, ProxyGuard
     
     try:
-        if is_job_cancelled(job_id):
+        if is_job_cancelled_sync(job_id):
             logger.info(f"Scrape task halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
             _mark_article_processed(job_id)
             return None
@@ -70,39 +70,62 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             _mark_article_processed(job_id)
             return None
             
-        # Resolve Google News redirect if needed (scaling mode sitemaps usually have direct URLs)
+        # --- FIX 3: Resolve Google News redirect with fallback retry ---
         resolved_url = url
         if "news.google.com" in url:
             resolved_url = resolve_google_news_url_sync(url)
+            # If resolution failed, retry once with a different approach
+            if not resolved_url or "news.google.com" in resolved_url:
+                try:
+                    with httpx.Client(timeout=10, follow_redirects=True) as client:
+                        resp = client.head(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                        if str(resp.url) and "news.google.com" not in str(resp.url):
+                            resolved_url = str(resp.url)
+                        else:
+                            # Last resort: GET request to force redirect
+                            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                            resolved_url = str(resp.url)
+                except Exception as resolve_err:
+                    logger.warning(f"Google News URL resolution retry failed for {url}: {resolve_err}")
         
-        if not resolved_url:
+        if not resolved_url or "news.google.com/rss/articles" in resolved_url:
+            logger.warning(f"Could not resolve Google News URL, skipping: {url}")
             _mark_article_processed(job_id)
             return None
         
         # --- FAST-TRACK SCRAPING (httpx + trafilatura) ---
         html = None
-        timeout = 5 if scaling_mode else 15
+        timeout = 5 if scaling_mode else 20
         
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+            }
             
             # --- Proxy Rotation ---
             proxy_pool = load_proxies()
             proxy = ProxyGuard.get_healthy_proxy(proxy_pool) if proxy_pool else None
             
             # Use connection pooling via httpx.Client
+            # FIX 1: Store HTML if status is 200, regardless of trafilatura pre-check.
+            # The full extract_body() in engine.py has multi-strategy extraction and will
+            # do a better job than a simple 400-char pre-gate here.
             with httpx.Client(timeout=timeout, follow_redirects=True, limits=httpx.Limits(max_connections=10), proxy=proxy) as client:
                 resp = client.get(resolved_url, headers=headers)
-                if resp.status_code == 200:
-                    text_content = trafilatura.extract(resp.text)
-                    if text_content and len(text_content) > 400:
-                        html = resp.text
-                elif resp.status_code in [403, 429, 503] and proxy:
-                    ProxyGuard.mark_unhealthy(proxy)
+                if resp.status_code == 200 and len(resp.text) > 500:
+                    html = resp.text  # Store HTML unconditionally; let extract_body() decide
+                elif resp.status_code in [403, 429, 503]:
+                    if proxy:
+                        ProxyGuard.mark_unhealthy(proxy)
+                    logger.debug(f"HTTP {resp.status_code} for {resolved_url}, will try browser fallback")
         except Exception as e:
             logger.debug(f"Fast-track failed for {resolved_url}: {e}")
 
-        # --- FALLBACK: POOLED BROWSER ---
+        # --- FALLBACK: POOLED BROWSER (always try for non-scaling mode if httpx failed) ---
         if not html and not scaling_mode:
             logger.info(f"Falling back to Pooled Browser for {resolved_url}")
             html = run_async(scrape_url(resolved_url))
@@ -127,10 +150,24 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             
             logger.info(f"Scraped article {article_id}. Triggering enrichment...")
             enrich_article_node.delay(article_id)
+            
+            try:
+                # Trigger semantic embedding generation in the background
+                from scraper.semantic import embed_article
+                with get_db_sync() as db:
+                    from db.database import Article
+                    from sqlalchemy import select
+                    art = db.execute(select(Article).where(Article.id == article_id)).scalar_one_or_none()
+                    if art and art.full_body:
+                        embed_article(art.id, art.title, art.full_body, art.sector, art.user_id)
+            except Exception as emb_e:
+                logger.warning(f"Failed to trigger semantic embedding for article {article_id}: {emb_e}")
         # Note: If article_id is None, scrape_only has already called _mark_article_processed
 
     except Exception as e:
-        logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
+        # FIX 4: logger is module-level so it is always defined; this block will no longer crash
+        _url = article_data.get('url', 'unknown') if isinstance(article_data, dict) else 'unknown'
+        logger.error(f"Scrape node failed for {_url}: {e}", exc_info=True)
         if self.request.retries >= self.max_retries:
             _mark_article_processed(job_id)
         raise self.retry(exc=e)
@@ -144,14 +181,14 @@ def enrich_article_node(self, article_id):
     Runs server-side, completely independent of user session.
     """
     from scraper.llm import perform_full_enrichment_sync
-    from scraper.engine import is_job_cancelled
+    from scraper.engine import is_job_cancelled_sync
     
     with get_db_sync() as db:
         res = db.execute(select(Article).where(Article.id == article_id))
         article = res.scalar_one_or_none()
         if not article or not article.full_body: return
         
-        if is_job_cancelled(article.scrape_job_id):
+        if is_job_cancelled_sync(article.scrape_job_id):
             logger.info(f"Enrichment cancelled for job {article.scrape_job_id}. Skipping article {article_id}")
             return
 

@@ -15,7 +15,7 @@ router = APIRouter()
 
 class BrandRequest(BaseModel):
     name: str = Field(..., max_length=100)
-    keywords: Optional[str] = Field(None, max_length=1000)
+    keywords: Optional[str] = Field(None, max_length=500000)
     region: Optional[str] = Field("india", max_length=50)
 
 def validate_keywords(keywords_str: Optional[str]):
@@ -23,8 +23,8 @@ def validate_keywords(keywords_str: Optional[str]):
         return
     # Clean and split by comma
     kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
-    if len(kw_list) > 15:
-        raise HTTPException(status_code=400, detail=f"Keyword limit exceeded. Maximum 15 keywords allowed (Current: {len(kw_list)}).")
+    # Keyword limit removed as per user request
+    pass
 
 @router.get("/")
 async def get_brands(current_user: TokenData = Depends(get_current_user)):

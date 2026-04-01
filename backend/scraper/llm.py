@@ -12,7 +12,7 @@ import ollama
 _groq_raw = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY") or ""
 GROQ_API_KEYS = [k.strip() for k in _groq_raw.split(",") if k.strip()]
 XAI_API_KEYS = [k.strip() for k in os.getenv("XAI_API_KEY", "").split(",") if k.strip()]
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")  # Hardware-optimized default
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
 # --- Redis for Global Throttling (C-7) ---
@@ -81,11 +81,29 @@ def summarize_with_grok_sync(text: str) -> Optional[str]:
                 time.sleep(1)
     return None
 
-# Compatibility wrapper for existing callers
+# Unified Summarization: Prioritizes Local GPU (Ollama) -> Groq -> Grok
 def summarize_with_groq_sync(text: str) -> Optional[str]:
-    # Primary: Groq (llama-3.3-70b-versatile) - fast and free tier friendly
+    if not text or len(text) < 100: return None
+    
+    # 1. Primary: Local GPU with Ollama (Free, Private, Fast on RTX 3060)
+    try:
+        import requests
+        model = OLLAMA_MODEL
+        if ":" not in model: model = f"{model}:latest"
+        prompt = f"You are a news analyst. Summarize this article into EXACTLY 3 bullet points. Output only the bullet points.\n\nArticle: {text[:5000]}"
+        r = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=45,
+        )
+        if r.status_code == 200:
+            return r.json().get("response", "").strip()
+    except Exception as e:
+        log(f"Ollama summarization failed, trying fallback: {e}")
+
+    # 2. Fallback: Groq (llama-3.3-70b-versatile)
     is_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
-    if GROQ_API_KEYS and not is_placeholder and text and len(text) >= 100:
+    if GROQ_API_KEYS and not is_placeholder:
         url = "https://api.groq.com/openai/v1/chat/completions"
         payload = {
             "model": "llama-3.3-70b-versatile",
@@ -111,7 +129,7 @@ def summarize_with_groq_sync(text: str) -> Optional[str]:
                 except:
                     pass
 
-    # Optional fallback: Grok (xAI) - only runs if XAI_API_KEY is configured
+    # 3. Final fallback: Grok (xAI)
     return summarize_with_grok_sync(text)
 
 # --- Ollama Client ---
@@ -222,8 +240,9 @@ def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, c
             results["author"] = f"{results['author']} (@{meta['handle']})" if results["author"] else f"@{meta['handle']}"
         
         results["agency"] = meta.get("agency")
-        # Placeholder for summary / sentiment
-        results["summary"] = meta.get("cleaned_body", body)[:1000]
+        
+        final_body = meta.get("cleaned_body", body)
+        results["summary"] = summarize_with_groq_sync(final_body) or final_body[:1000]
     except Exception as e:
         log(f"[llm] Enrichment bridge fail: {e}")
     

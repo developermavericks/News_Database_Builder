@@ -42,17 +42,25 @@ import asyncio
 
 # --- Sync-to-Async Bridge ---
 # Allows gevent/sync tasks to call persistent async components (BrowserPool)
-_loop = asyncio.new_event_loop()
-def _start_async_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+_loop = None
+_loop_thread = None
 
-_loop_thread = threading.Thread(target=_start_async_loop, args=(_loop,), daemon=True)
-_loop_thread.start()
+def _get_background_loop():
+    global _loop, _loop_thread
+    if _loop is None:
+        _loop = asyncio.new_event_loop()
+        def _start_async_loop(loop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        # Lazily spawn the thread to prevent Celery Gevent/Forking deadlocks on Windows
+        _loop_thread = threading.Thread(target=_start_async_loop, args=(_loop,), daemon=True)
+        _loop_thread.start()
+    return _loop
 
 def run_async(coro):
     """Bridge: Run an async coroutine on the background thread and wait for result."""
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    loop = _get_background_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result()
 
 print(f"NEXUS: Loaded Hardware Profile: {HARDWARE_PROFILE}")

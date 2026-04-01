@@ -72,6 +72,9 @@ async def list_all_jobs(
         query = query.where(and_(*filters))
     
     # Sorting
+    ALLOWLIST = {"started_at", "updated_at", "status", "total_scraped", "total_enriched"}
+    if sort_by not in ALLOWLIST:
+        sort_by = "started_at"
     sort_attr = getattr(ScrapeJob, sort_by, ScrapeJob.started_at)
     if sort_order == "desc":
         query = query.order_by(desc(sort_attr))

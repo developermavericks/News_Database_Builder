@@ -44,10 +44,7 @@ export default function BrandTracker({ onNavigate }) {
 
     const addBrand = async () => {
         if (!newBrand.trim()) return;
-        if (countKws(newKeywords) > 15) {
-            setMsg({ type: "error", text: "Keyword limit exceeded. Maximum 15 keywords allowed." });
-            return;
-        }
+        // No keyword restriction as requested by user
         try {
             await api.post("brands/", { 
                 name: newBrand.trim(),
@@ -64,10 +61,7 @@ export default function BrandTracker({ onNavigate }) {
     };
 
     const updateBrandNode = async (name, keywords, region) => {
-        if (countKws(keywords) > 15) {
-            setMsg({ type: "error", text: "Keyword limit exceeded (Max 15)." });
-            return;
-        }
+        // No keyword restriction as requested by user
         try {
             await api.put(`/brands/${encodeURIComponent(name)}`, { name, keywords, region });
             setEditingBrand(null);
@@ -167,36 +161,30 @@ export default function BrandTracker({ onNavigate }) {
                             </select>
                         </div>
                         <div style={{ position: 'relative' }}>
-                            <input
-                                type="text"
+                            <textarea
                                 className="form-control"
                                 placeholder="Keywords (comma separated)"
                                 value={newKeywords}
                                 onChange={(e) => setNewKeywords(e.target.value)}
                                 style={{ 
-                                    width: '100%', height: '48px', paddingRight: '100px',
-                                    borderColor: countKws(newKeywords) > 15 ? 'var(--danger)' : 'initial',
-                                    boxShadow: countKws(newKeywords) > 15 ? '0 0 0 2px var(--danger-bg)' : 'none'
+                                    width: '100%', height: '100px', 
+                                    paddingRight: '100px', paddingTop: '12px',
+                                    resize: 'vertical'
                                 }}
                             />
                             <div style={{ 
-                                position: 'absolute', right: '12px', top: '50%', transform: 'translateY(-50%)', 
-                                fontSize: '11px', color: countKws(newKeywords) > 15 ? 'var(--danger)' : 'var(--muted)',
+                                position: 'absolute', right: '12px', bottom: '12px', 
+                                fontSize: '11px', color: 'var(--muted)',
                                 fontWeight: '700'
                             }}>
-                                {countKws(newKeywords)} / 15 KW
+                                {countKws(newKeywords)} KW
                             </div>
                         </div>
-                        {countKws(newKeywords) > 15 && (
-                            <div style={{ fontSize: '11px', color: 'var(--danger)', fontWeight: '600', marginTop: '-8px' }}>
-                                ⚠ Intelligence limit reached. Remove {countKws(newKeywords) - 15} keyword(s) to proceed.
-                            </div>
-                        )}
                         <button 
                             className="btn btn-primary" 
                             onClick={addBrand} 
-                            disabled={countKws(newKeywords) > 15 || !newBrand.trim()}
-                            style={{ height: '48px', justifyContent: 'center', opacity: countKws(newKeywords) > 15 ? 0.5 : 1 }}
+                            disabled={!newBrand.trim()}
+                            style={{ height: '48px', justifyContent: 'center' }}
                         >
                             ⊕ Add Brand Node
                         </button>

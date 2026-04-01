@@ -20,11 +20,11 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     host = os.getenv("HOST", "0.0.0.0")
     
-    print(f"Starting NEXUS Backend on {host}:{port} with loop=asyncio (reload=OFF)")
+    print(f"Starting NEXUS Backend on {host}:{port} with loop=asyncio (reload=ON)")
     uvicorn.run(
         "main:app",
         host=host,
         port=port,
-        reload=False,
+        reload=True,
         loop="asyncio"
     )
