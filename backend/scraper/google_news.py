@@ -2,7 +2,9 @@ import httpx
 import logging
 import base64
 import re
+import hashlib
 from typing import Optional
+from scraper.llm import get_redis_sync
 
 logger = logging.getLogger("GOOGLE_NEWS")
 
@@ -35,39 +37,57 @@ def decode_google_news_url(url: str) -> Optional[str]:
     return None
 
 def resolve_google_news_url_sync(url: str) -> str:
-    """Synchronous version of resolve_google_news_url."""
-    if not url:
-        return ""
-        
-    # 1. Try decoding (Instant, Google specific)
+    """Synchronous version of resolve_google_news_url with Redis caching."""
+    if not url: return ""
+    
+    # 1. Check Redis Cache First
+    try:
+        redis = get_redis_sync()
+        cache_key = f"nexus:url_resolve:{hashlib.md5(url.encode()).hexdigest()}"
+        cached = redis.get(cache_key)
+        if cached: 
+            return cached if isinstance(cached, str) else cached.decode("utf-8")
+    except: 
+        redis = None
+        cache_key = None
+
+    # 2. Try decoding (Instant)
     if "news.google.com" in url:
         decoded = decode_google_news_url(url)
         if decoded:
+            if redis and cache_key:
+                try: redis.setex(cache_key, 86400 * 7, decoded)
+                except: pass
             return decoded
     
-    # 2. HTTP redirect resolution (Generic)
+    # 3. HTTP redirect resolution
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         }
         with httpx.Client(follow_redirects=True, timeout=8) as client:
-            try:
-                resp = client.head(url, headers=headers)
-                if resp.status_code < 400:
-                    return str(resp.url)
-            except: pass
-            
             resp = client.get(url, headers=headers)
-            # If bot detected or 403, fallback to pooled browser
-            # If bot detected or 403, fallback to sync browser
             if resp.status_code in (403, 503) or "google.com/images/errors/robot.png" in resp.text:
-                from scraper.browser import scrape_url
-                # Fetch with browser to bypass bots
-                html = scrape_url(url)
-                if html:
-                    # Logic to resolve from HTML could be added here if needed
-                    pass
+                try:
+                    from scraper.browser import scrape_url
+                    from config import run_async
+                    html = run_async(scrape_url(url))
+                    if html:
+                        import re as _re
+                        meta_refresh = _re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^;]+;\s*url=([^"\'>\s]+)', html, _re.I)
+                        if meta_refresh:
+                            final_url = meta_refresh.group(1)
+                            if redis and cache_key:
+                                try: redis.setex(cache_key, 86400 * 3, final_url)
+                                except: pass
+                            return final_url
+                except: pass
                 
-            return str(resp.url)
+            final_result = str(resp.url)
+            if "news.google.com" not in final_result:
+                if redis and cache_key:
+                    try: redis.setex(cache_key, 86400 * 7, final_result)
+                    except: pass
+            return final_result
     except Exception:
         return url

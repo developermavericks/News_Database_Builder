@@ -1,0 +1,5 @@
+ M backend/chroma_db/702f1c1f-bb3c-44fd-a9f8-b65cf2f59b32/data_level0.bin
+ M backend/chroma_db/702f1c1f-bb3c-44fd-a9f8-b65cf2f59b32/length.bin
+ M backend/chroma_db/chroma.sqlite3
+?? temp_status.txt
+?? temp_status_porcelain.txt

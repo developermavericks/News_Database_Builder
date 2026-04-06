@@ -163,7 +163,7 @@ export default function ArticlesBrowser() {
               <tr key={a.id} style={{ cursor: "pointer" }} onClick={() => openArticle(a.id)}>
                 <td style={{ maxWidth: 400 }}>
                   <div style={{ fontWeight: 600, fontSize: '15px', color: 'var(--text)', marginBottom: '4px' }}>{a.title}</div>
-                  <div style={{ fontSize: '12px', color: 'var(--muted)' }}>{a.author || "Global Desk"}</div>
+                  <div style={{ fontSize: '12px', color: 'var(--muted)' }}>{a.author ? `By ${a.author}` : "Unknown Author"}</div>
                 </td>
                 <td style={{ fontSize: '13px' }}>{a.agency || "Unknown Source"}</td>
                 <td style={{ fontSize: '13px' }}>

@@ -23,9 +23,21 @@ from routers import scrape, articles, diagnostics, brands, auth, admin
 from db.database import init_db, get_db, ScrapeJob, Article
 import logging
 
-# Standardized Logging
-logging.basicConfig(level=logging.INFO)
+# Standardized Logging with Rotation
+import logging.handlers
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler = logging.handlers.RotatingFileHandler('backend_log.txt', maxBytes=20*1024*1024, backupCount=5)
+file_handler.setFormatter(log_formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
 logger = logging.getLogger("API")
+
+# Silence noisy third-party libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
 
 # Environment Validation
 REQUIRED_ENV = ["DATABASE_URL", "REDIS_URL"]
@@ -97,6 +109,22 @@ async def startup_event():
         loop = asyncio.get_running_loop()
         loop.set_exception_handler(handle_loop_exception)
     except Exception: pass
+    
+    try:
+        from db.database import engine
+        from sqlalchemy import text, inspect
+        async with engine.begin() as conn:
+            def get_cols(connection):
+                inspector = inspect(connection)
+                return [c["name"] for c in inspector.get_columns("articles")]
+            
+            cols = await conn.run_sync(get_cols)
+            if "word_count" not in cols:
+                await conn.execute(text("ALTER TABLE articles ADD COLUMN word_count INTEGER DEFAULT 0"))
+            if "title_hash" not in cols:
+                await conn.execute(text("ALTER TABLE articles ADD COLUMN title_hash VARCHAR"))
+    except Exception as e:
+        logger.error(f"Migration error: {e}")
     
     print(f"API started. CORS origins: {ALLOWED_ORIGINS}")
 

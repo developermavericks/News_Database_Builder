@@ -20,24 +20,26 @@ try {
 } catch {}
 
 # Kill Celery / Python Workers
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -match "celery" -or $_.CommandLine -match "main.py" } | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -match "celery" -or $_.CommandLine -match "main" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Host "Terminated Celery & Main Python processes." -ForegroundColor Green
 
 Write-Host "=== NEXUS PHASE 2: LAUNCHING SERVICES ===" -ForegroundColor Cyan
 
+$RootDir = $PSScriptRoot
+
 # 1. Start Celery
-Write-Host "Launching Celery Workers (Gevent 16)..."
-$celery_cmd = "cd backend; `$env:PYTHONPATH='e:/MAVERICKS/zNews_Database_Builder/MorningTracker/backend;e:/MAVERICKS/zNews_Database_Builder/MorningTracker'; `$env:CELERY_WORKER_GEVENT=1; celery -A celery_app worker --loglevel=info -P gevent --concurrency=16"
+Write-Host "Launching Celery Workers (Threads 16)..."
+$celery_cmd = "cd `"$RootDir\backend`"; .\venv\Scripts\Activate.ps1; celery -A celery_app worker -l INFO -P threads -Q celery,scrape,enrich -c 16 --logfile ../worker.log"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "$celery_cmd"
 
 # 2. Start Backend
 Write-Host "Launching FastAPI Backend..."
-$backend_cmd = "cd backend; `$env:PYTHONPATH='e:/MAVERICKS/zNews_Database_Builder/MorningTracker/backend;e:/MAVERICKS/zNews_Database_Builder/MorningTracker'; python main.py"
+$backend_cmd = "cd `"$RootDir\backend`"; .\venv\Scripts\Activate.ps1; uvicorn main:app --reload --port 8000"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "$backend_cmd"
 
 # 3. Start Frontend
 Write-Host "Launching Vite Frontend..."
-$frontend_cmd = "cd frontend; npm run dev"
+$frontend_cmd = "cd `"$RootDir\frontend`"; npm run dev"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "$frontend_cmd"
 
 Write-Host "=== RESTART COMPLETE ===" -ForegroundColor Green

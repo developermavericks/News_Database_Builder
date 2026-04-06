@@ -6,5 +6,5 @@ venv/
 *.db
 *.log
 .git/
-.env
+.env*
 __pycache__/

@@ -51,7 +51,20 @@ apiClient.interceptors.response.use(
       return apiClient(originalRequest);
     }
 
-    const message = error.response?.data?.detail || error.message || 'Unknown Error';
+    const rawDetail = error.response?.data?.detail;
+    let message = 'Unknown Error';
+    
+    if (typeof rawDetail === 'string') {
+      message = rawDetail;
+    } else if (Array.isArray(rawDetail)) {
+      // Pydantic validation errors are usually lists
+      message = rawDetail.map(err => `${err.loc.join('.')}: ${err.msg}`).join(', ');
+    } else if (typeof rawDetail === 'object' && rawDetail !== null) {
+      message = JSON.stringify(rawDetail);
+    } else {
+      message = error.message || 'Unknown Error';
+    }
+    
     return Promise.reject(new Error(message));
   }
 );

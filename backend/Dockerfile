@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Install Python dependencies first (leverage cache)
-COPY backend/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright and its system dependencies the "official" way
@@ -24,7 +24,7 @@ RUN playwright install chromium
 RUN playwright install-deps chromium
 
 # Copy backend application code
-COPY backend/ .
+COPY . .
 
 # Default command: Production-grade Uvicorn with workers
 # Explicit sh -c ensures Railway's $PORT environment variable is correctly expanded at runtime
