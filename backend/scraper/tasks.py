@@ -47,7 +47,7 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
     default_retry_delay=10, 
     retry_backoff=True,
     retry_backoff_max=300,
-    rate_limit="200/m"
+    ignore_result=True  # Prevent Redis memory bloat
 )
 def scrape_article_node(self, article_data, job_id, sector, region, user_id, scaling_mode=False):
     """
@@ -135,7 +135,9 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             _mark_article_processed(job_id)
             return None
 
-        # Move processed data back to article_data for Engine
+        # scrape_only internally handles _mark_article_processed for all success/fail paths
+        # ENSURE resolved_url is never empty
+        if not resolved_url: resolved_url = url
         article_data["resolved_url"] = resolved_url
         article_data["raw_html"] = html
 
@@ -174,7 +176,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
 
 # ─── Enrichment Node (Compute Intensive) ──────────────────────────────────────
 
-@celery_app.task(name="scraper.tasks.enrich_article_node", bind=True, max_retries=3)
+@celery_app.task(name="scraper.tasks.enrich_article_node", bind=True, max_retries=3, ignore_result=True)
 def enrich_article_node(self, article_id):
     """
     Task Node 2: Performs AI analysis (Grok/Groq).

@@ -178,19 +178,23 @@ async def extract_metadata_with_ollama(body: str, url: str = "", context_agency:
     """
     Non-blocking wrapper for Ollama metadata extraction.
     """
-    if not body or len(body) < 100: return {"author": None, "agency": context_agency or None, "body": body}
     domain = get_domain_name(url) if url else ""
     
     prompt = (
-        f"Analyze this news article and extract metadata in JSON format.\n"
-        f"Target Fields: author (specific person), handle (social media), agency (news org), is_junk (bool), cleaned_body (text).\n\n"
+        f"Analyze this news article and extract high-precision metadata in JSON format.\n\n"
+        f"URL CONTEXT: {url}\n"
+        f"ESTIMATED AGENCY (from URL): {domain}\n\n"
         f"STAGED EVIDENCE:\n"
-        f"1. HTML Metadata Extraction Suggestion: {author_metadata.get('name') if author_metadata else 'None'}\n"
+        f"1. HTML Metadata Suggestion: {author_metadata.get('name') if author_metadata else 'None'}\n"
         f"2. Suggested Handle: {author_metadata.get('handle') if author_metadata else 'None'}\n"
         f"3. HTML HEAD SNIPPET: {html_snippets.get('head') if html_snippets else 'None'}\n"
         f"4. BYLINE AREA SNIPPET: {html_snippets.get('top') if html_snippets else 'None'}\n\n"
-        f"TASK: Use the snippets to verify or find the correct author.\n\n"
-        f"Text Sample: {body[:4000]}"
+        f"TASK:\n"
+        f"- Find the 'author'. If multiple, use the main reporter.\n"
+        f"- Find the 'agency' (news organization). Verify if it matches the domain {domain}.\n"
+        f"- Set 'is_junk' to true if the content is a cookie wall, paywall, or 'Access Denied'.\n"
+        f"- PROVIDE 'cleaned_body' by removing ads, menus, and footer junk.\n\n"
+        f"TEXT FOR ANALYSIS:\n{body[:6000]}"
     )
     
     loop = asyncio.get_running_loop()

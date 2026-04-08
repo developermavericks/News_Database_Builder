@@ -46,6 +46,11 @@ class BrowserPool:
         """
         if not self._initialized:
             await self.init()
+        
+        import asyncio
+        import random
+        # STAGGERED INITIALIZATION: Prevent many browsers from booting at once
+        await asyncio.sleep(random.uniform(0.1, 1.2))
             
         browser = await self._pool.get()
         context = await browser.new_context(

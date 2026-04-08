@@ -23,14 +23,14 @@ PROFILES = {
         "WORKER_MAX_MEMORY": 400_000,  # 400MB (in KB for Celery)
     },
     "64GB": {
-        "CELERY_CONCURRENCY": 32,
-        "DB_POOL_SIZE": 20,
-        "DB_MAX_OVERFLOW": 30,
-        "BROWSER_POOL_SIZE": 10,
-        "OLLAMA_MAX_WORKERS": 4,
-        "TASK_TIME_LIMIT": 1800,        # 30 minutes
-        "TASK_SOFT_TIME_LIMIT": 1500,   # 25 minutes
-        "WORKER_MAX_MEMORY": 1_000_000, # 1GB
+        "CELERY_CONCURRENCY": 100,      # Maximum article throughput
+        "DB_POOL_SIZE": 60,             # High-capacity DB pooling
+        "DB_MAX_OVERFLOW": 100,
+        "BROWSER_POOL_SIZE": 20,        # Increased fallback browsers
+        "OLLAMA_MAX_WORKERS": 12,       # Max out RTX 3060 Summarization
+        "TASK_TIME_LIMIT": 3600,
+        "TASK_SOFT_TIME_LIMIT": 3300,
+        "WORKER_MAX_MEMORY": 1_800_000, # 1.8GB per worker
     }
 }
 

@@ -80,55 +80,48 @@ class SitemapManager:
         return None
 
     async def parse_sitemap(self, client: httpx.AsyncClient, url: str, depth: int = 0) -> List[Dict]:
-        """Recursively parses sitemaps and sitemap indexes."""
-        if depth > 3: return [] # Avoid infinite loops
+        """Recursively parses sitemaps and sitemap indexes using streaming iterparse."""
+        if depth > 3: return []
         
         content = await self._fetch_xml(client, url)
         if not content: return []
 
         articles = []
         try:
-            # Use a more robust way to handle namespaces
-            root = etree.fromstring(content)
+            from io import BytesIO
+            # Use iterparse for memory-efficient streaming
+            # We wrap content in BytesIO for iterparse
+            context = etree.iterparse(BytesIO(content), events=('end',), tag=('{*}sitemap', '{*}url'))
             
-            # 1. Find sitemaps in index
-            sitemap_locs = root.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()")
-            if sitemap_locs:
-                logger.info(f"Indexing {len(sitemap_locs)} nested sitemaps from {url}")
-                tasks = []
-                for loc in sitemap_locs:
-                    # Broad filter: usually news sitemaps contain 'news' or dates
-                    if any(x in loc.lower() for x in ["news", "article", "2026", "2025"]):
-                        tasks.append(self.parse_sitemap(client, loc, depth + 1))
+            for event, elem in context:
+                # 1. Sitemap Index Handle
+                if elem.tag.endswith('sitemap'):
+                    loc = elem.findtext('{*}loc')
+                    if loc and any(x in loc.lower() for x in ["news", "article", "2026", "2025"]):
+                        # Process nested sitemaps recursively
+                        nested = await self.parse_sitemap(client, loc, depth + 1)
+                        articles.extend(nested)
                 
-                results = await asyncio.gather(*tasks)
-                for res in results: articles.extend(res)
-                return articles
-
-            # 2. Find URLs in leaf sitemap
-            url_nodes = root.xpath("//*[local-name()='url']")
-            logger.info(f"Found {len(url_nodes)} URL nodes in {url}")
-            
-            for node in url_nodes:
-                loc = node.xpath("./*[local-name()='loc']/text()")
-                if not loc: continue
-                loc = loc[0]
-
-                # Sector Matching
-                sector = self._is_sector_match(loc)
-                if sector:
-                    lastmod = node.xpath("./*[local-name()='lastmod']/text()")
-                    articles.append({
-                        "url": loc,
-                        "sector": sector,
-                        "published_at": lastmod[0] if lastmod else datetime.now().isoformat()
-                    })
-            
-            if articles:
-                logger.info(f"Extracted {len(articles)} matching articles from {url}")
-
+                # 2. Leaf Sitemap Handle
+                elif elem.tag.endswith('url'):
+                    loc = elem.findtext('{*}loc')
+                    if loc:
+                        sector = self._is_sector_match(loc)
+                        if sector:
+                            lastmod = elem.findtext('{*}lastmod')
+                            articles.append({
+                                "url": loc,
+                                "sector": sector,
+                                "published_at": lastmod if lastmod else datetime.now().isoformat()
+                            })
+                
+                # CRITICAL: Clear element to free memory immediately
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
+                    
         except Exception as e:
-            logger.error(f"Error parsing sitemap {url}: {e}")
+            logger.error(f"Error streaming sitemap {url}: {e}")
         
         return articles
 

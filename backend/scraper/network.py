@@ -35,9 +35,18 @@ class ProxyGuard:
         healthy = [p for p in pool if cls.is_healthy(p)]
         return random.choice(healthy) if healthy else (random.choice(pool) if pool else None)
 
+_PROXY_CACHE = []
+_LAST_LOAD_TIME = 0
+
 def load_proxies():
-    # TEMPORARILY DISABLED TO STABILIZE PIPELINE - PROXIES ARE CURRENTLY SLOW/BLOCKED
-    return [] 
+    """Returns the singular Webshare Rotating Proxy endpoint."""
+    rotating_proxy = os.getenv("WEBSHARE_PROXY_URL")
+    if rotating_proxy:
+        logger.info("NETWORK: Using Webshare Rotating Proxy Endpoint.")
+        return [rotating_proxy]
+        
+    global _PROXY_CACHE, _LAST_LOAD_TIME
+    # ... legacy fallback ...
 
 import threading
 
@@ -47,13 +56,15 @@ class RateLimiter:
 
     def __enter__(self):
         self._semaphore.acquire()
-        time.sleep(random.uniform(0.2, 0.5)) # Optimized delay for stability
+        time.sleep(random.uniform(0.01, 0.05)) # Reduced delay for high-speed Discovery
         return self
 
     def __exit__(self, *args):
         self._semaphore.release()
 
-rate_limiter = RateLimiter(max_concurrent=10)
+# Optimized concurrency for Rotating Proxy (limit 500 concurrent connections)
+# We use 480 to leave a small buffer for OS/Redis metadata overhead.
+rate_limiter = RateLimiter(max_concurrent=480)
 
 class NetworkHandler:
     @staticmethod
@@ -62,32 +73,34 @@ class NetworkHandler:
         return requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
 
     @staticmethod
-    def get_google_rss(url: str, proxy: Optional[str] = None, use_cache: bool = True) -> Optional[str]:
-        redis = get_redis_sync()
-        cache_key = f"nexus:rss_cache:{hashlib.md5(url.encode()).hexdigest()}"
+    def get_google_rss(url: str, proxy: Optional[str] = None) -> Optional[str]:
+        """
+        Fetches RSS content. Always fetches LIVE data (no caching) to prevent stale 0-results.
+        Forces Discovery through the proxy backbone to bypass local IP blocks.
+        """
+        # Discovery standard headers
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS), 
+            "Accept": "application/rss+xml,text/xml,*/*",
+            "Connection": "close"
+        }
         
-        if use_cache:
+        # DISCOVERY REDIRECTION: Force all RSS traffic through the proxy backbone.
+        active_proxy = proxy or load_proxies()[0] 
+        
+        for i in range(3): 
             try:
-                cached = redis.get(cache_key)
-                if cached: return cached if isinstance(cached, str) else cached.decode('utf-8')
-            except: pass
-
-        headers = {"User-Agent": random.choice(USER_AGENTS), "Accept": "application/rss+xml,text/xml,*/*", "Accept-Language": "en-US,en;q=0.9"}
-        for i in range(2):
-            try:
-                # Offload sync request to a thread pool to avoid blocking the event loop
-                resp = NetworkHandler._sync_fetch(url, headers, proxy, 8)
+                proxies = {"http": active_proxy, "https": active_proxy} if active_proxy else None
+                resp = requests.get(url, headers=headers, proxies=proxies, timeout=15, follow_redirects=True)
+                
                 if resp.status_code == 200:
                     content = resp.text
-                    try: redis.setex(cache_key, 600, content) 
-                    except: pass
-                    return content
-                if resp.status_code == 503:
-                    try: redis.incrby("nexus:global_503_count", 1)
-                    except: pass
-                    time.sleep(0.5)
-                    continue
-                resp.raise_for_status()
+                    if len(content) > 500: 
+                        return content
+                
+                logger.warning(f"Discovery proxy attempt {i+1} status: {resp.status_code}")
+                time.sleep(1)
+                time.sleep(0.5)
             except Exception as e:
                 if i == 1: logger.debug(f"RSS fetch failed ({url[:30]}): {e}")
                 time.sleep(0.5)

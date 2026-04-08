@@ -117,15 +117,48 @@ def verify_brand_relevance(text: str, keywords: List[str]) -> bool:
 
 import concurrent.futures
 
+def fetch_universal_rss(url: str, source: str, job_id: str = "SYSTEM") -> List[dict]:
+    """Universal RSS fetcher with Browser-Escape fallback."""
+    from scraper.network import NetworkHandler
+    
+    # 1. Faster: Proxied HTTP Request
+    content = NetworkHandler.get_google_rss(url)
+    
+    # 2. Resilient Fallback: Headless Browser (Solves JS Challenges/Shadow-bans)
+    if not content or len(content) < 1000:
+        log(f"HTTP RSS fetch failed/blocked for {source}. Escaping to Headless Browser...", job_id=job_id)
+        try:
+            from scraper.browser import scrape_url
+            from config import run_async
+            content = run_async(scrape_url(url))
+        except Exception as e:
+            logger.error(f"Browser escape failed for {source}: {e}")
+
+    if not content: return []
+    
+    try:
+        import feedparser
+        feed = feedparser.parse(content)
+        results = []
+        for entry in feed.entries:
+            results.append({
+                "title": entry.get("title", "No Title"),
+                "url": entry.get("link", ""),
+                "published_at": entry.get("published", datetime.now().isoformat()),
+                "agency": entry.get("source", {}).get("title", source.capitalize())
+            })
+        return results
+    except Exception as e:
+        logger.error(f"RSS Parse Error ({source}): {e}")
+        return []
+
 def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
     articles = []
     seen_urls = set()
-    proxy_pool = load_proxies() or []
     is_today = day >= date.today()
 
     def fetch_rss_sync(q, hl="en-IN", ceid="IN:en"):
         if is_job_cancelled_sync(job_id): return []
-        
         domain = "google.com" 
         if is_today:
             full_q = f"{q} when:1d"
@@ -134,57 +167,14 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
             date_str = day.strftime("%m/%d/%Y")
             tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
             rss_url = f"https://news.{domain}/rss/search?q={quote(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote(tbs)}"
-        
-        results = []
-        try:
-            proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
-            xml_content = NetworkHandler.get_google_rss(rss_url, proxy=proxy)
-            if not xml_content: return []
-
-            feed = feedparser.parse(xml_content)
-            for entry in feed.entries:
-                link = entry.link
-                if link not in seen_urls and (cumulative is None or link not in cumulative):
-                    parsed_date = None
-                    if hasattr(entry, 'published_parsed'):
-                        parsed_date = datetime.fromtimestamp(time.mktime(entry.published_parsed)).date()
-                    
-                    if is_today:
-                        if parsed_date and (day - parsed_date).days > 1: continue
-                    elif parsed_date and parsed_date != day: continue
-                        
-                    pub_date_str = day.isoformat()
-                    if hasattr(entry, 'published_parsed'):
-                        try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
-                        except: pass
-
-                    results.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
-            return results
-        except Exception as exc:
-            log(f"Discovery fail for '{q}': {exc}", job_id=job_id)
-            return []
+        return fetch_universal_rss(rss_url, "google", job_id)
 
     def fetch_bing_rss_sync(q):
         if is_job_cancelled_sync(job_id): return []
-        bing_url = f"https://www.bing.com/news/search?q={quote(q)}&format=rss&mkt=en-IN&sortby=date"
-        results = []
-        try:
-            proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
-            xml_content = NetworkHandler.get_google_rss(bing_url, proxy=proxy)
-            if not xml_content: return []
-            feed = feedparser.parse(xml_content)
-            for entry in feed.entries:
-                link = getattr(entry, 'link', None)
-                if not link or link in seen_urls or (cumulative and link in cumulative): continue
-                pub_date_str = day.isoformat()
-                if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
-                    except: pass
-                results.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": "Bing News"})
-            return results
-        except Exception as exc:
-            log(f"Bing discovery fail for '{q}': {exc}", job_id=job_id)
-            return []
+        url = f"https://www.bing.com/news/search?q={quote(q)}&format=rss"
+        return fetch_universal_rss(url, "bing", job_id)
+
+    # ... removed legacy bing fetch ...
 
     search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
     with get_db_sync() as db:
@@ -192,9 +182,12 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
         sector_name = job_res.scalar() or "Technology"
         is_brand_tracker = db.execute(select(WatchedBrand).where(WatchedBrand.name == sector_name)).first() is not None
     
-    window_queries = [kw for kw in keywords]
+    # Sanitization: Remove newlines from keywords that break RSS URLs
+    sanitized_keywords = [kw.replace("\n", " ").replace("\r", " ").strip() for kw in keywords]
+    window_queries = [kw for kw in sanitized_keywords]
+    
     if not is_brand_tracker:
-        for kw in keywords:
+        for kw in sanitized_keywords:
             for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 3)): 
                 window_queries.append(f"{kw} {mod}")
     
@@ -203,26 +196,31 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
     log(f"Discovery mission started: {len(window_queries)} keywords × 2 sources (Google+Bing) for day {day}", job_id=job_id)
     
     all_results = []
-    # Use 10 threads for balanced sync discovery
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_query = {}
-        for q in window_queries:
-            for lang in search_languages:
-                future_to_query[executor.submit(fetch_rss_sync, q, lang['code'], lang['ceid'])] = q
-                future_to_query[executor.submit(fetch_bing_rss_sync, q)] = q
-        
-        completed = 0
-        total = len(future_to_query)
-        for future in concurrent.futures.as_completed(future_to_query):
-            res = future.result()
-            if res:
-                for item in res:
-                    if item['url'] not in seen_urls:
-                        all_results.append(item)
-                        seen_urls.add(item['url'])
-            completed += 1
-            if completed % 20 == 0:
-                log(f"Discovery Progress [{day}]: {completed}/{total} tasks complete.", job_id=job_id)
+    # FINAL DISCOVERY FIX: Sub-batching keywords to avoid Google IP Soft-lock
+    BATCH_SIZE = 8
+    total_keywords = len(window_queries)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        for i in range(0, total_keywords, BATCH_SIZE):
+            batch = window_queries[i:i + BATCH_SIZE]
+            future_to_query = {}
+            for q in batch:
+                future_to_query[executor.submit(fetch_bing_rss_sync, q)] = (q, "bing")
+                for lang in search_languages:
+                    future_to_query[executor.submit(fetch_rss_sync, q, lang['code'], lang['ceid'])] = (q, "google")
+            
+            for future in concurrent.futures.as_completed(future_to_query):
+                res = future.result()
+                if res:
+                    for item in res:
+                        if item['url'] not in seen_urls and (cumulative is None or item['url'] not in cumulative):
+                            all_results.append(item)
+                            seen_urls.add(item['url'])
+            
+            # Vital "Cooldown" between batches to mask traffic
+            time.sleep(random.uniform(1.2, 2.5))
+            completed = min(i + BATCH_SIZE, total_keywords)
+            log(f"Discovery Progress [{day}]: {completed}/{total_keywords} keywords processed.", job_id=job_id)
 
     if cumulative is not None: cumulative.update(seen_urls)
     log(f"Discovery for {day} completed. Total found: {len(all_results)}", job_id=job_id)
@@ -252,6 +250,13 @@ async def discover_articles_scaling(job_id: str, sectors: List[str] = None) -> L
         if redis.sismember("nexus:processed_urls", url_hash) or url in seen_in_batch:
             continue
             
+        if not self._initialized:
+            await self.init()
+            
+        # STAGGERED INITIALIZATION: Prevent 20 browsers from slamming CPU at once
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        
+        browser = await self._pool.get()
         final_articles.append(a)
         seen_in_batch.add(url)
     

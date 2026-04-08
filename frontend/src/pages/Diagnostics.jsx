@@ -2,8 +2,27 @@ import { useState, useEffect } from "react";
 import { api } from "../services/api";
 
 export default function Diagnostics() {
+    // PERSISTENCE FIX: Define helper first
+    const checkSavedCooldown = () => {
+        const savedCooldownEnd = localStorage.getItem('nexus_emergency_stop_end');
+        if (savedCooldownEnd) {
+            const remaining = Math.floor((parseInt(savedCooldownEnd) - Date.now()) / 1000);
+            if (remaining > 0) {
+                return { active: true, seconds: remaining };
+            } else {
+                localStorage.removeItem('nexus_emergency_stop_end');
+            }
+        }
+        return { active: false, seconds: 0 };
+    };
+
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
+    
+    // Initialize state directly from localStorage
+    const status = checkSavedCooldown();
+    const [cooldown, setCooldown] = useState(status.seconds);
+    const [isCooldownActive, setIsCooldownActive] = useState(status.active);
 
     const fetchDiagnostics = async () => {
         try {
@@ -31,6 +50,42 @@ export default function Diagnostics() {
         const interval = setInterval(fetchDiagnostics, 15000);
         return () => clearInterval(interval);
     }, []);
+
+    // Re-check on every navigation mount to be absolutely sure
+    useEffect(() => {
+        const status = checkSavedCooldown();
+        if (status.active) {
+            setCooldown(status.seconds);
+            setIsCooldownActive(true);
+        }
+    }, []);
+
+    useEffect(() => {
+        let timer;
+        if (isCooldownActive && cooldown > 0) {
+            timer = setInterval(() => {
+                setCooldown(prev => {
+                    const nextValue = prev - 1;
+                    if (nextValue <= 0) {
+                        localStorage.removeItem('nexus_emergency_stop_end');
+                        setIsCooldownActive(false);
+                        return 0;
+                    }
+                    return nextValue;
+                });
+            }, 1000);
+        } else if (cooldown === 0) {
+            setIsCooldownActive(false);
+            localStorage.removeItem('nexus_emergency_stop_end');
+        }
+        return () => clearInterval(timer);
+    }, [isCooldownActive, cooldown]);
+
+    const formatTime = (seconds) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    };
 
     const getStatusColor = (status) => {
         switch (status) {
@@ -68,6 +123,14 @@ export default function Diagnostics() {
         try {
             setLoading(true);
             const res = await api.post("diagnostics/emergency-stop", { phrase });
+            
+            // Initiate 5-minute cooldown (300 seconds)
+            const endTime = Date.now() + (300 * 1000);
+            localStorage.setItem('nexus_emergency_stop_end', endTime.toString());
+            
+            setCooldown(300);
+            setIsCooldownActive(true);
+            
             alert("Emergency Stop Triggered: " + (res.results?.actions?.join(", ") || "Success"));
             await fetchDiagnostics();
         } catch (e) {
@@ -94,16 +157,61 @@ export default function Diagnostics() {
                     {/* <button className="btn btn-secondary" onClick={fetchDiagnostics} disabled={loading} style={{ background: 'var(--surface)' }}>
                         {loading ? "Refreshing..." : "↻ Forced Sync"}
                     </button> */}
-                    <button className="btn btn-danger" onClick={handleEmergencyStop} disabled={loading} style={{ 
-                        background: 'var(--danger)', 
+                    <button className="btn btn-danger" onClick={handleEmergencyStop} disabled={loading || isCooldownActive} style={{ 
+                        background: isCooldownActive ? 'var(--muted)' : 'var(--danger)', 
                         color: 'white',
                         border: 'none',
-                        boxShadow: '0 0 15px rgba(239, 68, 68, 0.4)'
+                        boxShadow: isCooldownActive ? 'none' : '0 0 15px rgba(239, 68, 68, 0.4)',
+                        cursor: isCooldownActive ? 'not-allowed' : 'pointer'
                     }}>
-                        {loading ? "Processing..." : "🛑 Emergency Stop"}
+                        {loading ? "Processing..." : isCooldownActive ? "🛑 System Cooldown" : "🛑 Emergency Stop"}
                     </button>
                 </div>
             </header>
+
+            {isCooldownActive && (
+                <div style={{
+                    marginBottom: '40px',
+                    padding: '40px',
+                    borderRadius: 'var(--radius-lg)',
+                    background: 'linear-gradient(135deg, #7f1d1d 0%, #450a0a 100%)',
+                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                    textAlign: 'center',
+                    boxShadow: '0 20px 40px rgba(0,0,0,0.4)',
+                    animation: 'shake 0.5s ease-in-out'
+                }}>
+                    <div style={{ 
+                        fontFamily: 'var(--font-mono)', 
+                        fontSize: '12px', 
+                        color: '#fca5a5', 
+                        textTransform: 'uppercase', 
+                        letterSpacing: '0.2em',
+                        marginBottom: '16px'
+                    }}>
+                        System Quarantine Active • Cooldown in Progress
+                    </div>
+                    <div style={{ 
+                        fontSize: '84px', 
+                        fontWeight: '800', 
+                        color: 'white', 
+                        fontFamily: 'var(--font-mono)',
+                        textShadow: '0 0 30px rgba(239, 68, 68, 0.5)',
+                        lineHeight: '1'
+                    }}>
+                        {formatTime(cooldown)}
+                    </div>
+                    <div style={{ 
+                        marginTop: '20px', 
+                        fontSize: '14px', 
+                        color: '#fca5a5',
+                        maxWidth: '500px',
+                        margin: '20px auto 0'
+                    }}>
+                        Intelligence streams have been forcefully severed. 
+                        The global stop flag will expire in 5 minutes to ensure hardware safety and data integrity.
+                    </div>
+                </div>
+            )}
 
             {/* <div style={{
                 padding: "24px",
