@@ -287,8 +287,9 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 except:
                     article_id = db.execute(select(Article.id).where(Article.url == article["url"])).scalar()
                     
-                from scraper.orchestrator import _mark_article_processed
-                _mark_article_processed(job_id)
+                # We DO NOT mark processed here if it's going to enrichment.
+                # The enrichment task will handle the final count.
+                pass
             
             if body and not date_invalid:
                 return article_id

@@ -68,8 +68,7 @@ def _mark_article_processed(job_id: str):
                     )
                 )
                 db.commit()
-                # Cleanup Redis counter after successful finalization
-                r.delete(counter_key)
+                # Cleanup Redis counter is handled by exploration/discovery phases or natural expiry
                 logger.info(f"Job {job_id} effectively finalized: {current_scraped}/{job.total_found} articles.")
                 
     except Exception as e:
