@@ -34,9 +34,13 @@ def _mark_article_processed(job_id: str, article_url: str = None):
         job_set_key = f"nexus:job_processed_set:{job_id}"
         
         # 1. Atomic Add to unique set
-        # If article_url is missing (e.g. fatal failure before URL resolve), 
-        # we generate a unique junk key to still count it as 'processed' but lost.
-        val = article_url if article_url else f"missing_url_{datetime.now().timestamp()}"
+        # We MUST use the Original Discovery URL to ensure idempotency across redirects/retries.
+        if not article_url:
+            logger.warning(f"ORCHESTRATOR: _mark_article_processed called without URL for job {job_id}. Falling back to deterministic ghost key.")
+            val = f"unknown_article_slot_{hashlib.md5(job_id.encode()).hexdigest()[:8]}"
+        else:
+            val = article_url
+
         r.sadd(job_set_key, val)
         
         # 2. Get current unique count

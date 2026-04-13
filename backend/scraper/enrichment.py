@@ -82,8 +82,9 @@ async def run_enrichment_async(job_id: Optional[str] = None, batch_size: int = 1
         failed = sum(1 for r in results if r is False or isinstance(r, Exception))
         
         if job_id:
-            db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=enriched + failed))
-            db.commit()
+            # db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=enriched + failed))
+            # db.commit()
+            pass
 
     log(f"Enrichment Done: {enriched} success, {failed} failed.")
     return {"enriched": enriched, "failed": failed}

@@ -138,7 +138,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             
         if not html:
             logger.warning(f"Maximum Depth Extraction failed for {resolved_url} (Job: {job_id})")
-            _mark_article_processed(job_id, article_url=resolved_url)
+            _mark_article_processed(job_id, article_url=url) # Standardized on ORIGINAL URL
             return None
 
         # Move processed data back to article_data for Engine
@@ -153,9 +153,9 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             redis.sadd("nexus:processed_urls", url_hash)
             
             logger.info(f"Scraped article {article_id}. Triggering enrichment...")
-            enrich_article_node.delay(article_id)
+            enrich_article_node.delay(article_id, original_url=url) # Pass original URL forward
         else:
-            _mark_article_processed(job_id, article_url=resolved_url)
+            _mark_article_processed(job_id, article_url=url) # Standardized on ORIGINAL URL
 
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
@@ -166,7 +166,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
 # ─── Enrichment Node (Compute Intensive) ──────────────────────────────────────
 
 @celery_app.task(name="scraper.tasks.enrich_article_node", bind=True, max_retries=3)
-def enrich_article_node(self, article_id):
+def enrich_article_node(self, article_id, original_url=None):
     """
     Task Node 2: Performs AI analysis (Grok/Groq).
     Runs server-side, completely independent of user session.
@@ -204,12 +204,12 @@ def enrich_article_node(self, article_id):
             
             # --- PROGRESS SYNC ---
             from scraper.orchestrator import _mark_article_processed
-            _mark_article_processed(article.scrape_job_id, article_url=article.url)
+            _mark_article_processed(article.scrape_job_id, article_url=original_url or article.url)
         except Exception as e:
             logger.error(f"AI Enrichment failed for article {article_id}: {e}")
             if self.request.retries >= self.max_retries:
                 from scraper.orchestrator import _mark_article_processed
-                _mark_article_processed(article.scrape_job_id, article_url=article.url)
+                _mark_article_processed(article.scrape_job_id, article_url=original_url or article.url)
             raise self.retry(exc=e, countdown=60)
 
 
@@ -235,17 +235,22 @@ def complete_stale_jobs():
             ).scalars().all()
 
             for job in running_jobs:
-                # Force-complete if total_scraped is near total_found (within 3 to handle edge cases)
-                if job.total_scraped >= max(0, job.total_found - 3):
+                from scraper.llm import get_redis_sync
+                r = get_redis_sync()
+                job_set_key = f"nexus:job_processed_set:{job.id}"
+                current_scraped = r.scard(job_set_key)
+
+                # Force-complete if total_scraped is near total_found
+                if current_scraped >= max(0, job.total_found - 3):
                     db.execute(
                         update(ScrapeJob).where(ScrapeJob.id == job.id).values(
                             status='completed',
                             current_phase='Completed',
-                            total_scraped=job.total_found,  # Correct the counter
+                            total_scraped=max(current_scraped, job.total_found),  # Sync from real truth
                             completed_at=datetime.now()
                         )
                     )
-                    logger.info(f"Watchdog force-completed stale job {job.id} ({job.total_scraped}/{job.total_found})")
+                    logger.info(f"Watchdog synchronized stale job {job.id} ({current_scraped}/{job.total_found})")
             
             db.commit()
     except Exception as e:
