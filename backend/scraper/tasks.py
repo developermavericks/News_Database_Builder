@@ -77,12 +77,12 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
     try:
         if is_job_cancelled(job_id):
             logger.info(f"Scrape task halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
-            _mark_article_processed(job_id)
+            _mark_article_processed(job_id, article_url=url)
             return None
 
         url = article_data.get("url") or article_data.get("link")
         if not url:
-            _mark_article_processed(job_id)
+            _mark_article_processed(job_id, article_url="unknown_missing_url")
             return None
             
         # Resolve Google News redirect if needed (scaling mode sitemaps usually have direct URLs)
@@ -91,7 +91,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             resolved_url = resolve_google_news_url_sync(url)
         
         if not resolved_url:
-            _mark_article_processed(job_id)
+            _mark_article_processed(job_id, article_url=url)
             return None
         
         # --- FAST-TRACK SCRAPING (Persistent Pooling) ---
@@ -104,15 +104,24 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             proxy_pool = load_proxies()
             proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
             
-            # Use shared client for pooling with proxy
+            # 1. Strict Proxy Enforcement for Google
+            is_google = "news.google.com" in resolved_url
+            if is_google and not proxy:
+                logger.error(f"Strict Proxy Hard-Block: No healthy proxies for Google URL {resolved_url}. Raising for retry.")
+                raise Exception("Proxy Unavailable for Google News")
+
+            # Use shared client (will be bare IP if proxy is deliberately None for non-Google)
             client = ScraperPersistence.get_sync_client(proxy=proxy, timeout=timeout)
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
             resp = client.get(resolved_url, headers=headers)
             
             if resp.status_code == 200:
                 text_content = trafilatura.extract(resp.text)
-                if text_content and len(text_content) > 400:
+                is_paywall = any(p in resp.text.lower() for p in ["subscribe to read", "premium content", "log in to access", "sign up to keep reading"])
+                if text_content and len(text_content) > 500 and not is_paywall:
                     html = resp.text
+                else:
+                    logger.info(f"Fast-track content thin ({len(text_content) if text_content else 0} chars) or paywall detected for {resolved_url}. Escalating...")
             elif resp.status_code in [403, 503] and proxy:
                 ProxyGuard.mark_unhealthy(proxy)
         except Exception as e:
@@ -121,14 +130,15 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
                 ProxyGuard.mark_unhealthy(proxy)
             logger.debug(f"Fast-track failed for {resolved_url}: {e}")
 
-        # --- FALLBACK: POOLED BROWSER ---
+        # --- FALLBACK: POOLED BROWSER (Max Depth Extraction) ---
         if not html and not scaling_mode:
-            logger.info(f"Falling back to Pooled Browser for {resolved_url}")
+            is_google = "news.google.com" in resolved_url
+            logger.info(f"Escalating to Pooled Browser for {resolved_url} (Max Depth Mode)")
             html = run_async(scrape_url(resolved_url))
             
         if not html:
-            logger.warning(f"Scrape failed for {resolved_url} (Job: {job_id})")
-            _mark_article_processed(job_id)
+            logger.warning(f"Maximum Depth Extraction failed for {resolved_url} (Job: {job_id})")
+            _mark_article_processed(job_id, article_url=resolved_url)
             return None
 
         # Move processed data back to article_data for Engine
@@ -145,7 +155,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             logger.info(f"Scraped article {article_id}. Triggering enrichment...")
             enrich_article_node.delay(article_id)
         else:
-            _mark_article_processed(job_id)
+            _mark_article_processed(job_id, article_url=resolved_url)
 
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
@@ -194,12 +204,12 @@ def enrich_article_node(self, article_id):
             
             # --- PROGRESS SYNC ---
             from scraper.orchestrator import _mark_article_processed
-            _mark_article_processed(article.scrape_job_id)
+            _mark_article_processed(article.scrape_job_id, article_url=article.url)
         except Exception as e:
             logger.error(f"AI Enrichment failed for article {article_id}: {e}")
             if self.request.retries >= self.max_retries:
                 from scraper.orchestrator import _mark_article_processed
-                _mark_article_processed(article.scrape_job_id)
+                _mark_article_processed(article.scrape_job_id, article_url=article.url)
             raise self.retry(exc=e, countdown=60)
 
 

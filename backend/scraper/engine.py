@@ -192,7 +192,7 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
 
         if not raw_html:
             from scraper.orchestrator import _mark_article_processed
-            _mark_article_processed(job_id)
+            _mark_article_processed(job_id, article_url=url)
             return None
 
         keywords = []
@@ -245,7 +245,7 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
             if not body or date_invalid:
                 from scraper.orchestrator import _mark_article_processed
                 db.execute(delete(Article).where(Article.url == article["url"]))
-                _mark_article_processed(job_id)
+                _mark_article_processed(job_id, article_url=article["url"])
             else:
                 val_dict = {
                     "title": article["title"], "url": article["url"], "resolved_url": resolved_url,

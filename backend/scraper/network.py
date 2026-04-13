@@ -42,29 +42,42 @@ class ProxyGuard:
 
     @classmethod
     def get_healthy_proxy(cls, pool: List[str]) -> Optional[str]:
+        """Strictly returns a healthy proxy from the pool or None. No fallbacks."""
+        if not pool: return None
+        
         healthy = [p for p in pool if cls.is_healthy(p)]
         if not healthy:
-            return random.choice(pool) if pool else None
-        return random.choice(healthy)
+            logger.error("PROXY-GUARD: All available proxies are blacklisted. Hard-blocking request.")
+            return None
+            
+        # Add selection jitter for high-concurrency requests hitting the same endpoint
+        # We sort by a hash to keep it stable but randomized
+        random.shuffle(healthy)
+        selected = healthy[0]
+        return selected
 
 def load_proxies():
     proxies = []
     
-    # 1. Primary: Secure credential loading from .env (Backbone Connection)
+    # 1. Primary: Secure credential loading from .env (Backbone/Residential)
     user_base = os.getenv("WEBSHARE_PROXY_USER")
     pw = os.getenv("WEBSHARE_PROXY_PASS")
     host = os.getenv("WEBSHARE_PROXY_HOST", "p.webshare.io")
+    use_ip_auth = os.getenv("WEBSHARE_IP_AUTH", "false").lower() == "true"
     
     if user_base and pw:
-        # Optimized for "Rotating Residential" proxies as seen in USER dashboard.
-        # These proxies usually rotate on the server-side, so we don't need the -i suffixes 
-        # which are for Backbone static slots and were causing 301 redirects.
+        # Optimized for "Rotating Residential" proxies.
         if "webshare.io" in host:
-            logger.info(f"NETWORK: Loading Webshare Rotating Residential endpoint for {user_base}")
-            # Port 80 is the standard entry point for Rotating Residential
-            proxies.append(f"http://{user_base}:{pw}@{host}:80")
+            logger.info(f"NETWORK: Loading Webshare Rotating Residential (IP Auth: {use_ip_auth})")
+            if use_ip_auth:
+                proxies.append(f"http://{host}:80") # IP-based auth doesn't need creds in URL
+            else:
+                proxies.append(f"http://{user_base}:{pw}@{host}:80")
         else:
-            proxies.append(f"http://{user_base}:{pw}@{host}")
+            if use_ip_auth:
+                proxies.append(f"http://{host}")
+            else:
+                proxies.append(f"http://{user_base}:{pw}@{host}")
             
     # 2. Secondary/Fallback: Load from local text files
     if not proxies:
@@ -76,7 +89,13 @@ def load_proxies():
                 with open(fpath, "r") as f:
                     for line in f:
                         parts = line.strip().split(":")
-                        if len(parts) == 4: proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+                        if len(parts) == 4:
+                            if use_ip_auth:
+                                proxies.append(f"http://{parts[0]}:{parts[1]}")
+                            else:
+                                proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+                        elif len(parts) == 2:
+                            proxies.append(f"http://{parts[0]}:{parts[1]}")
     
     proxies = list(dict.fromkeys(proxies))
     if not proxies:
@@ -172,20 +191,14 @@ class NetworkHandler:
                 
                 try:
                     client = await NetworkHandler.get_async_client(proxy=current_proxy)
-                    # We EXPLICITLY do NOT follow redirects for some proxy auth pages.
-                    # If it's a 301/302, we treat it as a proxy block and fallback.
-                    resp = await client.get(url, headers=headers, follow_redirects=False, timeout=10)
+                    # Follow redirects to handle Google News regional/HTTPS jumps
+                    resp = await client.get(url, headers=headers, follow_redirects=True, timeout=15)
                     
                     if resp.status_code == 200:
                         content = resp.text
                         if "<rss" in content.lower() or "<feed" in content.lower():
                             await redis.setex(cache_key, 3600, content)
                             return content
-                    
-                    if resp.status_code in [301, 302, 307, 308]:
-                        if current_proxy:
-                            logger.warning(f"RSS Discovery: Proxy Redirect ({resp.status_code}). Triggering DIRECT fallback.")
-                            continue # Try next attempt (None/Direct)
                     
                     if resp.status_code == 503:
                         await redis.incrby("nexus:global_503_count", 1)

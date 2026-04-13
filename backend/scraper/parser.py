@@ -38,7 +38,7 @@ def clean_author_text(text: Optional[str]) -> Optional[str]:
     return text
 
 def is_junk_body(body: Optional[str], brand_keywords: List[str] = None) -> bool:
-    if not body or len(body.strip()) < 50: return True
+    if not body or len(body.strip()) < 300: return True
     
     body_lower = body.lower()
     # Brand Tracker Override: If the brand is mentioned, ignore noisy junk patterns
@@ -180,15 +180,21 @@ def extract_body(html: str) -> str:
     2. JSON-LD articleBody (Most reliable if present)
     3. Trafilatura standard (Good fallback)
     """
-    # 1. Trafilatura bare extraction
+    # 1. Trafilatura bare extraction (Tuned for Maximum Precision)
     try:
-        res = trafilatura.bare_extraction(html)
-        if res and res.get('text') and len(res.get('text')) > 150:
+        res = trafilatura.bare_extraction(
+            html, 
+            include_comments=False, 
+            include_tables=True,
+            favor_precision=True,
+            include_links=False
+        )
+        if res and res.get('text') and len(res.get('text')) > 500:
             return res.get('text')
     except Exception as e:
         logger.debug(f"Trafilatura bare extraction failed: {e}")
 
-    # 2. JSON-LD articleBody
+    # 2. JSON-LD articleBody (High-Stability Fallback)
     try:
         soup = BeautifulSoup(html, "lxml")
         for script in soup.find_all("script", type="application/ld+json"):
@@ -199,16 +205,22 @@ def extract_body(html: str) -> str:
                     if not isinstance(item, dict): continue
                     if item.get("@type") in ["Article", "NewsArticle", "BlogPosting"]:
                         body = item.get("articleBody")
-                        if body and len(body) > 150: return body
+                        if body and len(body) > 300: return body
             except:
                 continue
     except Exception as e:
         logger.debug(f"JSON-LD body extraction failed: {e}")
 
-    # 3. Trafilatura standard
+    # 3. Trafilatura standard (Aggressive Final Resort)
     try:
-        ext = trafilatura.extract(html, include_comments=False, no_fallback=False)
-        if ext and len(ext) > 150: return ext
+        ext = trafilatura.extract(
+            html, 
+            include_comments=False, 
+            no_fallback=False,
+            include_tables=True,
+            include_images=False
+        )
+        if ext and len(ext) > 300: return ext
     except Exception as e:
         logger.debug(f"Trafilatura standard extraction failed: {e}")
 

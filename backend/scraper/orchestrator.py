@@ -22,21 +22,27 @@ def update_phase_status(db, job_id, phase_name, status):
     except Exception as e:
         logger.error(f"Error updating phase status for {job_id}: {e}")
 
-def _mark_article_processed(job_id: str):
+def _mark_article_processed(job_id: str, article_url: str = None):
     """
-    Safely increment total_scraped using Redis atomic counters.
-    Ensures robustness even if workers crash or restart.
+    Safely increment total_scraped using Redis atomic sets.
+    Ensures idempotency (1 article = 1 increment) regardless of retries.
     """
     from scraper.llm import get_redis_sync
+    import hashlib
     try:
         r = get_redis_sync()
-        counter_key = f"nexus:job_counter:{job_id}"
+        job_set_key = f"nexus:job_processed_set:{job_id}"
         
-        # 1. Atomic increment in Redis
-        current_scraped = r.incr(counter_key)
+        # 1. Atomic Add to unique set
+        # If article_url is missing (e.g. fatal failure before URL resolve), 
+        # we generate a unique junk key to still count it as 'processed' but lost.
+        val = article_url if article_url else f"missing_url_{datetime.now().timestamp()}"
+        r.sadd(job_set_key, val)
         
-        # 2. Sync to DB occasionally (every 5 increments) to maintain visibility 
-        # and permanently on the final increment
+        # 2. Get current unique count
+        current_scraped = r.scard(job_set_key)
+        
+        # 3. Sync to DB occasionally (every 5 increments)
         with get_db_sync() as db:
             job = db.execute(
                 select(ScrapeJob.total_found, ScrapeJob.status)
@@ -55,7 +61,7 @@ def _mark_article_processed(job_id: str):
                 )
                 db.commit()
 
-            # 3. Finalize job if all articles are accounted for
+            # 4. Finalize job if all articles are accounted for
             if is_final and job.status != 'completed':
                 db.execute(
                     update(ScrapeJob)
@@ -68,8 +74,7 @@ def _mark_article_processed(job_id: str):
                     )
                 )
                 db.commit()
-                # Cleanup Redis counter is handled by exploration/discovery phases or natural expiry
                 logger.info(f"Job {job_id} effectively finalized: {current_scraped}/{job.total_found} articles.")
                 
     except Exception as e:
-        logger.error(f"Error marking article processed (Redis-Atomic) for job {job_id}: {e}")
+        logger.error(f"Error marking article processed (Redis-Idempotent) for job {job_id}: {e}")

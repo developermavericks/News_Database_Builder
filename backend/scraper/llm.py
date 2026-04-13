@@ -157,19 +157,18 @@ _llm_executor = ThreadPoolExecutor(max_workers=CURRENT_PROFILE["OLLAMA_MAX_WORKE
 
 def _call_ollama_blocking(prompt: str) -> str:
     """Synchronous blocking call to Ollama API."""
-    import requests
     try:
         # Use provided model or fallback
         model = OLLAMA_MODEL
         if ":" not in model: model = f"{model}:latest"
         
-        r = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["response"]
+        with httpx.Client(timeout=60) as client:
+            r = client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+            )
+            r.raise_for_status()
+            return r.json()["response"]
     except Exception as e:
         raise e
 
@@ -226,6 +225,13 @@ def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, c
     
     # 1. Primary Extraction with Hardware-Tuned Ollama (Synchronous)
     try:
+        from scraper.graph import graphify_article, graph_to_context_string
+        
+        # --- NEW: Graphify-First Architecture (Token Optimization) ---
+        # Map the article into a dense Knowledge Graph before summarization
+        article_graph = graphify_article(body, title=title)
+        graph_context = graph_to_context_string(article_graph)
+        
         meta = extract_metadata_with_ollama(
             body, 
             url=url, 
@@ -244,10 +250,12 @@ def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, c
         results["is_junk"] = meta.get("is_junk", False)
         
         # 2. Unified Summarization Flow
-        # Priority: 1. Ollama (local) -> 2. Groq (Fast Cloud) -> 3. Grok (xAI) -> 4. Placeholder
-        summary = summarize_with_ollama_sync(body)
+        # Priority: Use the dense Knowledge Map for token efficiency
+        summary_context = graph_context if graph_context else body
+        
+        summary = summarize_with_ollama_sync(summary_context)
         if not summary:
-            summary = summarize_with_groq_sync(body)
+            summary = summarize_with_groq_sync(summary_context)
             
         if summary:
             results["summary"] = summary

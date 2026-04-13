@@ -102,7 +102,7 @@ class BrowserPool:
                            if route.request.resource_type in ["image", "media", "font"] 
                            else route.continue_())
             
-            yield page
+            yield page, proxy_url
         except Exception as e:
             logger.error(f"Error using pooled page: {e}")
             if "Browser closed" in str(e) or "Target closed" in str(e):
@@ -137,23 +137,53 @@ async def scrape_url(url: str, timeout: int = 30000, use_proxy: bool = True) -> 
     """
     logger.info(f"Stealth Pool Scraper: Navigating to {url} (Proxy: {use_proxy})")
     
-    # Selective Resilience: Try with proxy first, fallback to direct if tunnel fails
-    attempts = [use_proxy, False] if use_proxy else [False]
+    # Selective Resilience: Try with proxy first, fallback to direct ONLY for non-Google links
+    is_google = "news.google.com" in url
+    attempts = [use_proxy]
+    if use_proxy and not is_google:
+        attempts.append(False) # Fallback to direct only if not Google
+    elif not use_proxy:
+        attempts = [False]
+    last_proxy = None
     
     for current_use_proxy in attempts:
         try:
-            async with browser_pool.acquire_page(use_proxy=current_use_proxy) as page:
-                # Optimized for content extraction
+            async with browser_pool.acquire_page(use_proxy=current_use_proxy) as (page, actual_proxy):
+                # actual_proxy stores whichever healthy proxy was pulled from the pool
+                last_proxy = actual_proxy
+
+                # --- Optimized for Deep Content Extraction ---
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-                await page.wait_for_timeout(1000)
-                await page.mouse.wheel(0, 500)
+                await page.wait_for_timeout(2000) # Wait for initial hydration
+                
+                # Multi-stage Deep Scroll (Bypasses Lazy Loading)
+                # We scroll in 3 increments to trigger hydration of the main body
+                for i in range(3):
+                    await page.mouse.wheel(0, 1500)
+                    await page.wait_for_timeout(800)
+                
+                # Scroll back up slightly to trigger any "sticky" content blocks
+                await page.mouse.wheel(0, -500)
                 await page.wait_for_timeout(500)
+                
+                # Final stability wait
+                await page.wait_for_load_state("networkidle", timeout=5000)
+                
                 return await page.content()
         except Exception as e:
-            if current_use_proxy and ("TUNNEL_CONNECTION_FAILED" in str(e) or "PROXY_CONNECTION_FAILED" in str(e)):
+            err_msg = str(e)
+            if current_use_proxy and any(p in err_msg for p in ["TUNNEL_CONNECTION_FAILED", "PROXY_CONNECTION_FAILED", "Proxy unavailable"]):
+                if last_proxy:
+                    from scraper.network import ProxyGuard
+                    ProxyGuard.mark_unhealthy(last_proxy, duration=600) # 10 min blacklist
+                
+                if is_google:
+                    logger.error(f"Scrape Proxy Tunnel Failed. ABORTING direct fallback for Google URL: {url}")
+                    return None
+                
                 logger.warning(f"Scrape Proxy Tunnel Failed. Retrying DIRECT for {url}...")
                 continue
-            logger.error(f"Stealth Pool Scraper error: {str(e)}")
+            logger.error(f"Stealth Pool Scraper error: {err_msg}")
             return None
     return None
 
@@ -163,7 +193,7 @@ async def resolve_url_via_browser(url: str, timeout: int = 30000, use_proxy: boo
     """
     logger.info(f"Stealth Browser Resolution: Navigating to {url} (Proxy: {use_proxy})")
     try:
-        async with browser_pool.acquire_page(use_proxy=use_proxy) as page:
+        async with browser_pool.acquire_page(use_proxy=use_proxy) as (page, _):
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(1000)
             return page.url
