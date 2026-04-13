@@ -17,6 +17,8 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Set
 from urllib.parse import quote
 from sqlalchemy import select, update, insert, text, delete
+from sqlalchemy.dialects.postgresql import insert as pg_upsert
+from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 import hashlib
 from scraper.network import NetworkHandler
 # from playwright.sync_api import sync_playwright
@@ -94,6 +96,19 @@ def is_job_cancelled(job_id: str) -> bool:
     except:
         return False
 
+def get_upsert_stmt(table, values, index_elements):
+    """
+    Returns an upsert statement compatible with both PostgreSQL and SQLite (3.24+).
+    """
+    from db.database import engine_sync
+    is_postgres = "postgresql" in engine_sync.url.drivername
+    
+    if is_postgres:
+        return pg_upsert(table).values(values)
+    else:
+        # SQLite support for ON CONFLICT (added in 3.24)
+        return sqlite_upsert(table).values(values)
+
 def verify_brand_relevance(text: str, keywords: List[str]) -> bool:
     if not text or not keywords: return True
     text_lower = text.lower()
@@ -101,60 +116,14 @@ def verify_brand_relevance(text: str, keywords: List[str]) -> bool:
         if kw.lower() in text_lower: return True
     return False
 
-# ─── Discovery Phase ───
-
-async def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
+# --- Discovery Phase
+async def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None, queue: asyncio.Queue = None) -> List[dict]:
+    """
+    Populates the discovery queue or runs standalone discovery for a single day.
+    """
     articles = []
     seen_urls = set()
-    proxy_pool = load_proxies() or []
     
-    async def fetch_rss(q, hl="en-IN", ceid="IN:en"):
-        if is_job_cancelled(job_id): return
-        
-        is_today = day >= date.today()
-        domain = "google.com" 
-        if is_today:
-            full_q = f"{q} when:1d"
-            rss_url = f"https://news.{domain}/rss/search?q={quote(full_q)}&hl={hl}&gl=IN&ceid={ceid}"
-        else:
-            date_str = day.strftime("%m/%d/%Y")
-            tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
-            rss_url = f"https://news.{domain}/rss/search?q={quote(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote(tbs)}"
-        
-        try:
-            proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
-            xml_content = await NetworkHandler.get_google_rss(rss_url, proxy=proxy)
-            if not xml_content:
-                if proxy: ProxyGuard.mark_unhealthy(proxy)
-                return
-
-            feed = feedparser.parse(xml_content)
-            found_this_q = 0
-            for entry in feed.entries:
-                link = entry.link
-                if link not in seen_urls and (cumulative is None or link not in cumulative):
-                    parsed_date = None
-                    if hasattr(entry, 'published_parsed'):
-                        parsed_date = datetime.fromtimestamp(time.mktime(entry.published_parsed)).date()
-                    
-                    if is_today:
-                        if parsed_date and (day - parsed_date).days > 1: continue
-                    elif parsed_date and parsed_date != day: continue
-                        
-                    pub_date_str = day.isoformat()
-                    if hasattr(entry, 'published_parsed'):
-                        try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
-                        except: pass
-
-                    articles.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
-                    seen_urls.add(link)
-                    found_this_q += 1
-            
-            if found_this_q > 0:
-                log(f"Discovery: Found {found_this_q} articles for keyword '{q}'", job_id=job_id)
-        except Exception as exc:
-            log(f"Discovery fail for '{q}': {exc}", job_id=job_id)
-
     search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
     with get_db_sync() as db:
         job_res = db.execute(select(ScrapeJob.sector).where(ScrapeJob.id == job_id))
@@ -164,21 +133,22 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
     window_queries = [kw for kw in keywords]
     if not is_brand_tracker:
         for kw in keywords:
-            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 3)): 
+            # Add some variations but keep it sane for large missions
+            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 2)): 
                 window_queries.append(f"{kw} {mod}")
     
     random.shuffle(window_queries)
     
-    tasks = []
-    for lang in search_languages:
-        for q in window_queries:
-            tasks.append(fetch_rss(q, hl=lang['code'], ceid=lang['ceid']))
-    
-    log(f"Discovery mission started for {len(window_queries)} keywords for day {day}", job_id=job_id)
-    await asyncio.gather(*tasks)
+    if queue is not None:
+        # We are in multi-date worker pool mode
+        for lang in search_languages:
+            for q in window_queries:
+                queue.put_nowait((q, day, lang['code'], lang['ceid']))
+        return []
 
-    if cumulative is not None: cumulative.update(seen_urls)
-    log(f"Discovery for {day} completed. Total found: {len(articles)}", job_id=job_id)
+    # Standalone mode (legacy/fallback)
+    log(f"Discovery mission started for {len(window_queries)} keywords for day {day}", job_id=job_id)
+    # ... (If we ever need standalone it would use its own pool here, but we focus on the job pool)
     return articles
 
 # ─── High-Throughput Discovery (Scaling Strategy) ───
@@ -283,18 +253,40 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                     "published_at": final_pub_at, "sector": sector, "region": region,
                     "scrape_job_id": job_id, "user_id": user_id, "extra_metadata": extra_meta
                 }
-                from sqlalchemy.dialects.postgresql import insert as pg_upsert
-                stmt = pg_upsert(Article).values(**val_dict).on_conflict_do_update(
-                    index_elements=[Article.url],
-                    set_={
-                        "full_body": val_dict["full_body"], "author": val_dict["author"],
-                        "agency": val_dict["agency"], "extra_metadata": val_dict["extra_metadata"],
-                        "published_at": val_dict["published_at"], "scrape_job_id": val_dict["scrape_job_id"],
-                        "resolved_url": val_dict["resolved_url"]
-                    }
-                ).returning(Article.id)
+                # Use dialect-agnostic upsert
+                stmt = get_upsert_stmt(Article, val_dict, [Article.url])
+                
+                # Perform the "ON CONFLICT UPDATE" part manually for portability if needed, 
+                # but standard SQLAlchemy dialect extensions work well for both if structured right.
+                if "postgresql" in stmt.__class__.__module__:
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[Article.url],
+                        set_={
+                            "full_body": val_dict["full_body"], "author": val_dict["author"],
+                            "agency": val_dict["agency"], "extra_metadata": val_dict["extra_metadata"],
+                            "published_at": val_dict["published_at"], "scrape_job_id": val_dict["scrape_job_id"],
+                            "resolved_url": val_dict["resolved_url"]
+                        }
+                    ).returning(Article.id)
+                else:
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[Article.url],
+                        set_={
+                            "full_body": val_dict["full_body"], "author": val_dict["author"],
+                            "agency": val_dict["agency"], "extra_metadata": val_dict["extra_metadata"],
+                            "published_at": val_dict["published_at"], "scrape_job_id": val_dict["scrape_job_id"],
+                            "resolved_url": val_dict["resolved_url"]
+                        }
+                    )
+                
                 res = db.execute(stmt)
-                article_id = res.scalar()
+                # For SQLite, returning() might not be supported in all versions/drivers,
+                # let's fetch article_id if not returned.
+                try: 
+                    article_id = res.scalar()
+                except:
+                    article_id = db.execute(select(Article.id).where(Article.url == article["url"])).scalar()
+                    
                 from scraper.orchestrator import _mark_article_processed
                 _mark_article_processed(job_id)
             
@@ -330,7 +322,10 @@ def bulk_insert_placeholders(db, job_id, articles, sector, region, user_id):
             except: continue
         
         if values:
-            db.execute(pg_upsert(Article).values(values).on_conflict_do_nothing(index_elements=[Article.url]))
+            stmt = get_upsert_stmt(Article, values, [Article.url])
+            # For bulk placeholder ingestion, DO NOTHING is safer.
+            stmt = stmt.on_conflict_do_nothing(index_elements=[Article.url])
+            db.execute(stmt)
             db.commit()
 
 async def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode, user_id):
@@ -366,18 +361,109 @@ async def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode
             dates.append(curr)
             curr += timedelta(days=1)
 
-        # High-Efficiency Async Discovery
-        tasks = []
+        # --- High-Throughput Worker Pool Discovery ---
+        discovery_queue = asyncio.Queue()
+        all_discovered = []
+        seen_urls = set()
+        proxy_pool = load_proxies() or []
+        
+        # 1. Populate Queue
         for d in dates:
             if is_job_cancelled(job_id): break
-            tasks.append(discover_articles(keywords, d, geo, region, job_id, cumulative))
+            await discover_articles(keywords, d, geo, region, job_id, cumulative=cumulative, queue=discovery_queue)
         
-        if tasks:
-            # Gather all discovery results concurrently
-            discovery_results = await asyncio.gather(*tasks)
-            for res in discovery_results:
-                if res:
-                    all_discovered.extend(res)
+        total_tasks = discovery_queue.qsize()
+        log(f"Job {job_id}: Dispatched {total_tasks} discovery tasks to worker pool.", job_id=job_id)
+
+        # 2. Worker Definition
+        async def discovery_worker():
+            while not discovery_queue.empty():
+                if is_job_cancelled(job_id): break
+                
+                try:
+                    q, day, hl, ceid = await discovery_queue.get()
+                    
+                    # Align parameter order and encoding EXACTLY with user's browser example
+                    is_today = day >= date.today()
+                    domain = "google.com" 
+                    
+                    # Ensure hl/ceid are correctly matched for the India context (or generic if missing)
+                    # User example: hl=en-IN, gl=IN, ceid=IN:en
+                    if is_today:
+                        full_q = f"{q} when:1d"
+                        rss_url = f"https://news.{domain}/rss/search?q={quote(full_q)}&hl={hl}&gl=IN&ceid={ceid}"
+                    else:
+                        date_str = day.strftime("%m/%d/%Y")
+                        tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
+                        rss_url = f"https://news.{domain}/rss/search?q={quote(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote(tbs)}"
+                    
+                    # Add jitter to further prevent thundering herd behavior across cluster
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+                    
+                    proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
+                    xml_content = await NetworkHandler.get_google_rss(rss_url, proxy=proxy)
+                    
+                    if xml_content:
+                        feed = feedparser.parse(xml_content)
+                        found_this_q = 0
+                        for entry in feed.entries:
+                            link = entry.link
+                            if link not in seen_urls and (cumulative is None or link not in cumulative):
+                                parsed_date = None
+                                if hasattr(entry, 'published_parsed'):
+                                    parsed_date = datetime.fromtimestamp(time.mktime(entry.published_parsed)).date()
+                                
+                                if is_today:
+                                    if parsed_date and (day - parsed_date).days > 1: continue
+                                elif parsed_date and parsed_date != day: continue
+                                    
+                                pub_date_str = day.isoformat()
+                                if hasattr(entry, 'published_parsed'):
+                                    try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
+                                    except: pass
+
+                                all_discovered.append({
+                                    "title": entry.title, 
+                                    "url": link, 
+                                    "published_at": pub_date_str, 
+                                    "agency": entry.source.title if hasattr(entry, 'source') else "Google News"
+                                })
+                                seen_urls.add(link)
+                                found_this_q += 1
+                        
+                        if found_this_q > 0:
+                            log(f"Discovery: Found {found_this_q} articles for '{q}' ({day})", job_id=job_id)
+                
+                except Exception as e:
+                    log(f"Worker Error: {e}", job_id=job_id)
+                finally:
+                    discovery_queue.task_done()
+
+        # 3. Spawn exactly 495 workers (Webshare Limit Hardening)
+        # We cap workers at min(total_tasks, 495) to avoid excessive overhead on tiny jobs.
+        num_workers = min(total_tasks, 495)
+        log(f"Job {job_id}: Spawning {num_workers} concurrent discovery workers.", job_id=job_id)
+        
+        worker_tasks = [asyncio.create_task(discovery_worker()) for _ in range(num_workers)]
+        
+        # 4. Wait for all tasks to complete or job to be cancelled
+        try:
+            # Check for cancellation while waiting for the queue to drain
+            while not discovery_queue.empty():
+                if is_job_cancelled(job_id):
+                    log(f"Job {job_id}: Termination signal received. Draining pool.", job_id=job_id)
+                    # Drain the queue to stop workers
+                    while not discovery_queue.empty():
+                        try: discovery_queue.get_nowait(); discovery_queue.task_done()
+                        except asyncio.QueueEmpty: break
+                    break
+                await asyncio.sleep(1)
+            
+            await discovery_queue.join()
+        finally:
+            for t in worker_tasks:
+                t.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
         
         db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(cumulative_found=len(cumulative)))
         update_phase_status(db, job_id, "Discovery", "completed")

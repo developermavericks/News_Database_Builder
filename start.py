@@ -1,9 +1,14 @@
 import subprocess
 import sys
+import io
 import os
 import time
 import socket
 import logging
+
+# Set standard IO to unbuffered or ensure flush for Windows live logs
+import os
+os.environ['PYTHONUNBUFFERED'] = '1'
 
 # Basic logging for the orchestrator
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -33,24 +38,29 @@ def start_redis_docker():
         return False
 
 def cleanup_zombies():
-    """Kill any orphaned python/celery processes associated with this project."""
+    """Kill any orphaned processes associated with this project (Python, Celery, Vite)."""
     logger.info("Cleaning up existing processes...")
     if os.name == 'nt':
-        # On Windows, we use wmic to be selective and terminate processes that are part of the project.
         try:
-            # Kill processes that have 'celery' or 'run_backend' in the command line
-            # This is safer than killing all python.exe processes.
+            # 1. Kill processes holding project ports (Vite/Backend)
+            for port in [8000, 5173]:
+                subprocess.run(['powershell', '-Command', 
+                               f'Stop-Process -Id (Get-NetTCPConnection -LocalPort {port}).OwningProcess -Force'], 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # 2. Kill project processes by command line signature
             subprocess.run(['wmic', 'process', 'where', "commandline like '%celery%' or commandline like '%run_backend%'", 'call', 'terminate'], 
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
             time.sleep(2) # Give it a moment to clear Redis connections
         except Exception as e:
             logger.warning(f"Cleanup routine warning: {e}")
     return True
 
 def main():
-    print("\n" + "="*50)
-    print(" 🛡️  NEXUS - Global News Intelligence Orchestrator")
-    print(" " + "="*50 + "\n")
+    print("\n" + "="*50, flush=True)
+    print(" [NEXUS] - Global News Intelligence Orchestrator", flush=True)
+    print(" " + "="*50 + "\n", flush=True)
 
     cleanup_zombies()
 
@@ -80,7 +90,7 @@ def main():
         if not start_redis_docker():
             logger.error("Redis is required but not running. Please start Redis or Docker Desktop.")
             sys.exit(1)
-    logger.info("✅ Redis Connection Verified.")
+    logger.info("[OK] Redis Connection Verified.")
 
     # 2. Port Cleanup
     for port in [8000, 5173]:
@@ -121,13 +131,13 @@ def main():
         # Start Frontend
         start_service("Frontend (Vite)", [npx_exe, "vite", "--port", "5173", "--host"], frontend_dir, "frontend.log")
 
-        print("\n" + "🚀 All services initialized!".center(50))
-        print("-" * 50)
-        print(f" ➜ Dashboard:  http://localhost:5173")
-        print(f" ➜ API Docs:   http://localhost:8000/docs")
-        print("-" * 50)
-        print(" Logs available in root directory: api.log, worker.log, beat.log, frontend.log")
-        print(" Press Ctrl+C to shutdown all services safely.\n")
+        print("\n" + "--- All services initialized! ---".center(50), flush=True)
+        print("-" * 50, flush=True)
+        print(f" - Dashboard:  http://localhost:5173", flush=True)
+        print(f" - API Docs:   http://localhost:8000/docs", flush=True)
+        print("-" * 50, flush=True)
+        print(" Logs available in root directory: api.log, worker.log, beat.log, frontend.log", flush=True)
+        print(" Press Ctrl+C to shutdown all services safely.\n", flush=True)
 
         while True:
             time.sleep(5)

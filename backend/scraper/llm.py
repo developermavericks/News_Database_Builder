@@ -114,6 +114,23 @@ def summarize_with_groq_sync(text: str) -> Optional[str]:
     # Optional fallback: Grok (xAI) - only runs if XAI_API_KEY is configured
     return summarize_with_grok_sync(text)
 
+def summarize_with_ollama_sync(text: str) -> Optional[str]:
+    """Summarizes article using local Ollama instance."""
+    if not text or len(text) < 100: return None
+    
+    prompt = (
+        "You are a news analyst. Summarize this article into EXACTLY 3 bullet points. "
+        "Output ONLY the bullet points, no preamble or extra text.\n\n"
+        f"Article Content:\n{text[:5000]}"
+    )
+    
+    try:
+        # Optimized for hardware (blocking call in worker thread)
+        return _call_ollama_blocking(prompt)
+    except Exception as e:
+        log(f"[ollama] summarization failed: {e}")
+        return None
+
 # --- Ollama Client ---
 from urllib.parse import urlparse
 
@@ -156,11 +173,14 @@ def _call_ollama_blocking(prompt: str) -> str:
     except Exception as e:
         raise e
 
-async def extract_metadata_with_ollama(body: str, url: str = "", context_agency: str = "", author_metadata: Dict = None, html_snippets: Dict = None) -> Dict[str, Any]:
+def extract_metadata_with_ollama(body: str, url: str = "", context_agency: str = "", author_metadata: Dict = None, html_snippets: Dict = None) -> Dict[str, Any]:
     """
-    Non-blocking wrapper for Ollama metadata extraction.
+    Synchronous metadata extraction using Ollama.
+    Optimized for Celery solo worker stability on Windows.
     """
-    if not body or len(body) < 100: return {"author": None, "agency": context_agency or None, "body": body}
+    if not body or len(body) < 100: 
+        return {"author": None, "agency": context_agency or None, "body": body}
+    
     domain = get_domain_name(url) if url else ""
     
     prompt = (
@@ -175,12 +195,9 @@ async def extract_metadata_with_ollama(body: str, url: str = "", context_agency:
         f"Text Sample: {body[:4000]}"
     )
     
-    loop = asyncio.get_running_loop()
     try:
-        content = await asyncio.wait_for(
-            loop.run_in_executor(_llm_executor, _call_ollama_blocking, prompt),
-            timeout=65
-        )
+        # Use our existing hardware-tuned blocking call
+        content = _call_ollama_blocking(prompt)
         data = json.loads(content)
         
         res_agency = data.get("agency")
@@ -204,26 +221,40 @@ def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, c
     if not body or len(body) < 100: return results
     
     extra_metadata = extra_metadata or {}
-    author_metadata = extra_metadata.get("author_metadata")
-    html_snippets = extra_metadata.get("html_snippets")
+    author_metadata = extra_metadata.get("author_metadata") or {}
+    html_snippets = extra_metadata.get("html_snippets") or {}
     
-    # 1. Primary Extraction with Hardware-Tuned Ollama (Bridged)
+    # 1. Primary Extraction with Hardware-Tuned Ollama (Synchronous)
     try:
-        meta = run_async(extract_metadata_with_ollama(
+        meta = extract_metadata_with_ollama(
             body, 
             url=url, 
             context_agency=context_agency, 
             author_metadata=author_metadata,
             html_snippets=html_snippets
-        ))
+        )
         
-        results["author"] = meta.get("author")
-        if meta.get("handle"):
-            results["author"] = f"{results['author']} (@{meta['handle']})" if results["author"] else f"@{meta['handle']}"
+        # Merge deterministic parser data with LLM inference
+        results["author"] = meta.get("author") or author_metadata.get("name")
+        if meta.get("handle") or author_metadata.get("handle"):
+            h = meta.get("handle") or author_metadata.get("handle")
+            results["author"] = f"{results['author']} (@{h})" if results["author"] else f"@{h}"
         
-        results["agency"] = meta.get("agency")
-        # Placeholder for summary / sentiment
-        results["summary"] = meta.get("cleaned_body", body)[:1000]
+        results["agency"] = meta.get("agency") or context_agency or get_domain_name(url)
+        results["is_junk"] = meta.get("is_junk", False)
+        
+        # 2. Unified Summarization Flow
+        # Priority: 1. Ollama (local) -> 2. Groq (Fast Cloud) -> 3. Grok (xAI) -> 4. Placeholder
+        summary = summarize_with_ollama_sync(body)
+        if not summary:
+            summary = summarize_with_groq_sync(body)
+            
+        if summary:
+            results["summary"] = summary
+        else:
+            # Final fallback to truncation if all AI fails
+            results["summary"] = meta.get("cleaned_body", body)[:1000]
+            
     except Exception as e:
         log(f"[llm] Enrichment bridge fail: {e}")
     

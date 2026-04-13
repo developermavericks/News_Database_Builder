@@ -63,7 +63,7 @@ sync_connect_args = {"timeout": 60} if "sqlite" in get_sync_url() else {"connect
 engine_sync = create_engine(get_sync_url(), connect_args=sync_connect_args, **engine_args)
 SessionLocalSync = sessionmaker(bind=engine_sync, expire_on_commit=False)
 
-# ─── Models ──────────────────────────────────────────────────────────────────
+# --- Models ---
 
 class Base(DeclarativeBase):
     pass
@@ -146,7 +146,7 @@ class WatchedBrand(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     last_scraped: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
-# ─── Initialization ───────────────────────────────────────────────────────────
+# --- Initialization ---
 
 async def init_db():
     async with engine.begin() as conn:
@@ -170,7 +170,7 @@ async def create_partitions(sectors: List[str]):
             # Scaling Strategy optimization: Use index-based partitioning or separate tables if needed.
             pass
 
-# ─── Connection Lifecycle ─────────────────────────────────────────────────────
+# --- Connection Lifecycle ---
 
 @asynccontextmanager
 async def get_db():
@@ -216,7 +216,7 @@ def init_db_sync():
     Base.metadata.create_all(bind=engine_sync)
     print(f"Sync Database initialized via SQLAlchemy ({engine_sync.url.drivername})")
 
-# ─── Celery Fork Safety ───────────────────────────────────────────────────────
+# --- Celery Fork Safety ---
 
 try:
     from celery.signals import worker_process_init

@@ -4,6 +4,7 @@ import hashlib
 import httpx
 import trafilatura
 from datetime import datetime
+from typing import Optional
 from celery_app import app as celery_app
 from config import run_async
 from db.database import get_db_sync, Article, ScrapeJob
@@ -12,6 +13,21 @@ from scraper.browser import scrape_url
 from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
+
+class ScraperPersistence:
+    """Manages persistent network resources for workers."""
+    _sync_clients: dict = {}
+    
+    @classmethod
+    def get_sync_client(cls, proxy: Optional[str] = None, timeout: int = 15) -> httpx.Client:
+        if proxy not in cls._sync_clients or cls._sync_clients[proxy].is_closed:
+            cls._sync_clients[proxy] = httpx.Client(
+                proxy=proxy,
+                timeout=timeout, 
+                follow_redirects=True, 
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50)
+            )
+        return cls._sync_clients[proxy]
 
 
 # --- Orchestrator Task --------------------------------------------------------
@@ -78,20 +94,31 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
             _mark_article_processed(job_id)
             return None
         
-        # --- FAST-TRACK SCRAPING (httpx + trafilatura) ---
+        # --- FAST-TRACK SCRAPING (Persistent Pooling) ---
         html = None
         timeout = 5 if scaling_mode else 15
         
         try:
+            # --- BACKBONE ROTATION ---
+            from scraper.network import load_proxies, ProxyGuard
+            proxy_pool = load_proxies()
+            proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
+            
+            # Use shared client for pooling with proxy
+            client = ScraperPersistence.get_sync_client(proxy=proxy, timeout=timeout)
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
-            # Use connection pooling via httpx.Client
-            with httpx.Client(timeout=timeout, follow_redirects=True, limits=httpx.Limits(max_connections=10)) as client:
-                resp = client.get(resolved_url, headers=headers)
-                if resp.status_code == 200:
-                    text_content = trafilatura.extract(resp.text)
-                    if text_content and len(text_content) > 400:
-                        html = resp.text
+            resp = client.get(resolved_url, headers=headers)
+            
+            if resp.status_code == 200:
+                text_content = trafilatura.extract(resp.text)
+                if text_content and len(text_content) > 400:
+                    html = resp.text
+            elif resp.status_code in [403, 503] and proxy:
+                ProxyGuard.mark_unhealthy(proxy)
         except Exception as e:
+            if proxy:
+                from scraper.network import ProxyGuard
+                ProxyGuard.mark_unhealthy(proxy)
             logger.debug(f"Fast-track failed for {resolved_url}: {e}")
 
         # --- FALLBACK: POOLED BROWSER ---
@@ -164,8 +191,15 @@ def enrich_article_node(self, article_id):
             
             db.commit()
             logger.info(f"Successfully enriched article {article_id}")
+            
+            # --- PROGRESS SYNC ---
+            from scraper.orchestrator import _mark_article_processed
+            _mark_article_processed(article.scrape_job_id)
         except Exception as e:
             logger.error(f"AI Enrichment failed for article {article_id}: {e}")
+            if self.request.retries >= self.max_retries:
+                from scraper.orchestrator import _mark_article_processed
+                _mark_article_processed(article.scrape_job_id)
             raise self.retry(exc=e, countdown=60)
 
 

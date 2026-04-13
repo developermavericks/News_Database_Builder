@@ -45,3 +45,10 @@ playwright/.local-browsers
 # OS
 .DS_Store
 Thumbs.db
+
+# Assistant & AI
+.agent/
+.gemini/
+GEMINI.md
+*.png
+graphify-out/

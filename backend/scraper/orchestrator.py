@@ -24,33 +24,53 @@ def update_phase_status(db, job_id, phase_name, status):
 
 def _mark_article_processed(job_id: str):
     """
-    Safely increment total_scraped and mark job as completed if all articles processed.
-    Uses atomic increment and RETURNING for high-concurrency safety.
+    Safely increment total_scraped using Redis atomic counters.
+    Ensures robustness even if workers crash or restart.
     """
+    from scraper.llm import get_redis_sync
     try:
+        r = get_redis_sync()
+        counter_key = f"nexus:job_counter:{job_id}"
+        
+        # 1. Atomic increment in Redis
+        current_scraped = r.incr(counter_key)
+        
+        # 2. Sync to DB occasionally (every 5 increments) to maintain visibility 
+        # and permanently on the final increment
         with get_db_sync() as db:
-            # Atomic update with returning for certain dialects, 
-            # but for generic support we do increment + fresh read
-            db.execute(
-                update(ScrapeJob)
-                .where(ScrapeJob.id == job_id)
-                .values(total_scraped=ScrapeJob.total_scraped + 1)
-            )
-            db.commit() # Commit the increment first
-            
-            # Post-increment check with fresh state
             job = db.execute(
-                select(ScrapeJob.total_found, ScrapeJob.total_scraped, ScrapeJob.status)
+                select(ScrapeJob.total_found, ScrapeJob.status)
                 .where(ScrapeJob.id == job_id)
             ).first()
             
-            if job and job.total_found > 0 and job.total_scraped >= job.total_found and job.status != 'completed':
+            if not job: return
+
+            is_final = current_scraped >= job.total_found
+            
+            if current_scraped % 5 == 0 or is_final:
                 db.execute(
                     update(ScrapeJob)
                     .where(ScrapeJob.id == job_id)
-                    .values(status='completed', current_phase='Completed', completed_at=datetime.now())
+                    .values(total_scraped=current_scraped)
                 )
                 db.commit()
-                logger.info(f"Job {job_id} finalized: {job.total_scraped}/{job.total_found} articles.")
+
+            # 3. Finalize job if all articles are accounted for
+            if is_final and job.status != 'completed':
+                db.execute(
+                    update(ScrapeJob)
+                    .where(ScrapeJob.id == job_id)
+                    .values(
+                        status='completed', 
+                        current_phase='Completed', 
+                        completed_at=datetime.now(),
+                        total_scraped=current_scraped
+                    )
+                )
+                db.commit()
+                # Cleanup Redis counter after successful finalization
+                r.delete(counter_key)
+                logger.info(f"Job {job_id} effectively finalized: {current_scraped}/{job.total_found} articles.")
+                
     except Exception as e:
-        logger.error(f"Error marking article processed for job {job_id}: {e}")
+        logger.error(f"Error marking article processed (Redis-Atomic) for job {job_id}: {e}")
