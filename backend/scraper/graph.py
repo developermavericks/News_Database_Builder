@@ -30,13 +30,8 @@ def graphify_article(text: str, title: str = "") -> Dict[str, Any]:
         
         response = _call_ollama_blocking(prompt)
         
-        # Clean up Markdown JSON blocks if present
-        if "```json" in response:
-            response = response.split("```json")[1].split("```")[0].strip()
-        elif "```" in response:
-            response = response.split("```")[1].split("```")[0].strip()
-            
-        data = json.loads(response)
+        from scraper.llm import safe_json_parse
+        data = safe_json_parse(response)
         
         # Validation
         if "nodes" not in data: data["nodes"] = []

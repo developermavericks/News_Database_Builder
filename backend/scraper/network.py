@@ -12,7 +12,8 @@ from scraper.config import USER_AGENTS
 
 logger = logging.getLogger(__name__)
 
-# --- Proxy Management ---
+# --- Singleton Cache for Proxy Pool (Speed Optimization for 4k+ proxies) ---
+_GLOBAL_PROXY_POOL = None
 class ProxyGuard:
     """
     Global Proxy Guard using Redis for distributed state consistency.
@@ -21,11 +22,10 @@ class ProxyGuard:
     REDIS_KEY = "nexus:proxy_blacklist"
     
     @classmethod
-    def mark_unhealthy(cls, proxy_url: str, duration: int = 300):
+    def mark_unhealthy(cls, proxy_url: str, duration: int = 1200): # Increased to 20m for reputation recovery
         if not proxy_url: return
         try:
             r = get_redis_sync()
-            # Store in Redis with an expiration
             r.setex(f"{cls.REDIS_KEY}:{proxy_url}", duration, "unhealthy")
             logger.warning(f"PROXY-GUARD: Blacklisted {proxy_url[:30]}... for {duration}s across cluster.")
         except Exception as e:
@@ -46,33 +46,48 @@ class ProxyGuard:
         if not pool: return None
         
         healthy = [p for p in pool if cls.is_healthy(p)]
+        
+        # Log health stats for large pools
+        total = len(pool)
+        living = len(healthy)
+        if total > 50:
+             logger.info(f"PROXY-GUARD: {living}/{total} proxies are currently healthy.")
+
         if not healthy:
             logger.error("PROXY-GUARD: All available proxies are blacklisted. Hard-blocking request.")
             return None
             
         # Add selection jitter for high-concurrency requests hitting the same endpoint
-        # We sort by a hash to keep it stable but randomized
         random.shuffle(healthy)
-        selected = healthy[0]
-        return selected
+        return healthy[0]
 
-def load_proxies():
+def load_proxies(force_reload: bool = False):
+    global _GLOBAL_PROXY_POOL
+    
+    if _GLOBAL_PROXY_POOL is not None and not force_reload:
+        return _GLOBAL_PROXY_POOL
+
     proxies = []
+    logger.info("NETWORK: Initializing Proxy Pool from configuration...")
     
     # 1. Primary: Secure credential loading from .env (Backbone/Residential)
     user_base = os.getenv("WEBSHARE_PROXY_USER")
     pw = os.getenv("WEBSHARE_PROXY_PASS")
     host = os.getenv("WEBSHARE_PROXY_HOST", "p.webshare.io")
     use_ip_auth = os.getenv("WEBSHARE_IP_AUTH", "false").lower() == "true"
+    proxy_geo = os.getenv("PROXY_GEO", "US") # Default to US to bypass IN blocks
     
     if user_base and pw:
+        # Support geo-targeting via username suffix if provided
+        targeted_user = f"{user_base}-country-{proxy_geo}" if proxy_geo and "webshare.io" in host else user_base
+        
         # Optimized for "Rotating Residential" proxies.
         if "webshare.io" in host:
-            logger.info(f"NETWORK: Loading Webshare Rotating Residential (IP Auth: {use_ip_auth})")
+            logger.info(f"NETWORK: Loading Webshare Rotating {proxy_geo} Residential (IP Auth: {use_ip_auth})")
             if use_ip_auth:
                 proxies.append(f"http://{host}:80") # IP-based auth doesn't need creds in URL
             else:
-                proxies.append(f"http://{user_base}:{pw}@{host}:80")
+                proxies.append(f"http://{targeted_user}:{pw}@{host}:80")
         else:
             if use_ip_auth:
                 proxies.append(f"http://{host}")
@@ -80,27 +95,31 @@ def load_proxies():
                 proxies.append(f"http://{user_base}:{pw}@{host}")
             
     # 2. Secondary/Fallback: Load from local text files
-    if not proxies:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for fname in ["Webshare 10 proxies.txt", "webshare_proxies.txt"]:
-            fpath = os.path.join(base_dir, fname)
-            if os.path.exists(fpath):
-                logger.info(f"NETWORK: Falling back to proxy file: {fname}")
-                with open(fpath, "r") as f:
-                    for line in f:
-                        parts = line.strip().split(":")
-                        if len(parts) == 4:
-                            if use_ip_auth:
-                                proxies.append(f"http://{parts[0]}:{parts[1]}")
-                            else:
-                                proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
-                        elif len(parts) == 2:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for fname in ["Webshare 10 proxies.txt", "webshare_proxies.txt"]:
+        fpath = os.path.join(base_dir, fname)
+        if os.path.exists(fpath):
+            logger.info(f"NETWORK: Loading proxy file: {fname}")
+            with open(fpath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    parts = line.split(":")
+                    if len(parts) == 4:
+                        if use_ip_auth:
                             proxies.append(f"http://{parts[0]}:{parts[1]}")
+                        else:
+                            proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+                    elif len(parts) == 2:
+                        proxies.append(f"http://{parts[0]}:{parts[1]}")
     
     proxies = list(dict.fromkeys(proxies))
     if not proxies:
         logger.warning("NETWORK: No proxies loaded. Pipeline will run on server IP (UNSAFE).")
-    return proxies
+    
+    _GLOBAL_PROXY_POOL = proxies
+    logger.info(f"NETWORK: Proxy Pool energized with {len(proxies)} unique endpoints.")
+    return _GLOBAL_PROXY_POOL
 
 
 class RedisRateLimiter:
@@ -178,15 +197,20 @@ class NetworkHandler:
             await asyncio.sleep(5)
             return None
 
-        # Discovery Strategy: Proxy -> Direct Fallback
-        attempts = [proxy, None] if proxy else [None]
+        # Discovery Strategy: Multi-Proxy Retry with Exponential Backoff
+        max_retries = int(os.getenv("MAX_PROXY_RETRIES", 3))
+        proxy_pool = load_proxies()
         
-        for current_proxy in attempts:
+        for attempt in range(max_retries + 1):
+            # Pick a fresh healthy proxy or fallback to direct on last attempt
+            current_proxy = ProxyGuard.get_healthy_proxy(proxy_pool) if attempt < max_retries else None
+            
             async with rate_limiter:
                 headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    "User-Agent": random.choice(USER_AGENTS),
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Cookie": "CONSENT=YES+cb.20230531-17-p0.en+FX+908",
                 }
                 
                 try:
@@ -203,11 +227,19 @@ class NetworkHandler:
                     if resp.status_code == 503:
                         await redis.incrby("nexus:global_503_count", 1)
                         await redis.expire("nexus:global_503_count", 300)
+                    
+                    if resp.status_code in [403, 429, 503] and current_proxy:
+                        ProxyGuard.mark_unhealthy(current_proxy, duration=1200)
                 
                 except Exception as e:
                     if current_proxy:
-                        logger.warning(f"RSS Discovery: Proxy Error ({e}). Triggering DIRECT fallback.")
+                        ProxyGuard.mark_unhealthy(current_proxy, duration=1200)
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(f"RSS Discovery Failure (Attempt {attempt+1}/{max_retries}): {e}. Backing off {wait_time:.1f}s...")
+                        await asyncio.sleep(wait_time)
                         continue
-                    logger.error(f"RSS Discovery: Direct fetch failed: {e}")
+                    logger.error(f"RSS Discovery: Final direct fetch failed: {e}")
+        
+        return None
         
         return None

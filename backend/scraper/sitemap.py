@@ -65,7 +65,7 @@ class SitemapManager:
                     if resp.status_code in [403, 401, 407, 429]:
                         logger.warning(f"SITEMAP BLOCK ({resp.status_code}) on {url} using {proxy[:20]}...")
                         if proxy:
-                            ProxyGuard.mark_unhealthy(proxy, duration=600)
+                            ProxyGuard.mark_unhealthy(proxy, duration=1200)
                         await asyncio.sleep(2) # Wait before retry
                         continue
                     
@@ -74,7 +74,7 @@ class SitemapManager:
             except Exception as e:
                 logger.error(f"FETCH ERROR: {url} | {type(e).__name__}")
                 if proxy:
-                    ProxyGuard.mark_unhealthy(proxy, duration=300)
+                    ProxyGuard.mark_unhealthy(proxy, duration=1200)
                 await asyncio.sleep(1)
                 
         return None

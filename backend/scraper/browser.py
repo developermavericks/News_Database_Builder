@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
@@ -30,6 +31,7 @@ class BrowserPool:
                 "--enable-features=NetworkServiceInProcess",
                 "--disable-blink-features=ScriptStreaming",
                 "--js-flags=--max-old-space-size=256", 
+                "--host-resolver-rules=\"MAP * 8.8.8.8, MAP * 1.1.1.1\"", # DNS Resilience Phase 1.1
             ],
         )
 
@@ -60,6 +62,7 @@ class BrowserPool:
             browser = await self._launch_browser()
 
         try:
+            proxy_url = None
             proxy_config = None
             if use_proxy:
                 from scraper.network import load_proxies, ProxyGuard
@@ -82,6 +85,9 @@ class BrowserPool:
                     except Exception as pe:
                         logger.warning(f"Proxy parse error: {pe}. Falling back to raw string.")
                         proxy_config = {"server": proxy_url}
+                    
+                    # Log health context for traceability
+                    logger.info(f"BROWSER-POOL: Using randomized healthy proxy from pool.")
             
             # Using latest Chrome 121/122 profile for maximum parity
             user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -97,11 +103,40 @@ class BrowserPool:
             # Apply Advanced Stealth Evasions (v2.x class-based API)
             await Stealth().apply_stealth_async(page)
             
-            # Block heavy/unnecessary resources
-            await page.route("**/*", lambda route: route.abort() 
-                           if route.request.resource_type in ["image", "media", "font"] 
-                           else route.continue_())
+            # --- PHASE 2.2: AGGRESSIVE RESOURCE BLOCKING ---
+            # Block heavy and bot-signature resources
+            await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,pdf,ico}", lambda route: route.abort())
             
+            # --- CONSENT BYPASS: Inject pre-accepted states ---
+            try:
+                # SOCS and CONSENT are the primary Google persistence tokens for "Accepted"
+                await context.add_cookies([
+                    {
+                        "name": "SOCS",
+                        "value": "CAESHAgBEhJnd3NfMjAyMzA4MzAtMF9SQzIaAnB0IAEaBgiA_LmkBg", # Encoded "Accepted" state
+                        "domain": ".google.com",
+                        "path": "/",
+                    },
+                    {
+                        "name": "CONSENT",
+                        "value": "YES+cb.20230531-17-p0.en+FX+908",
+                        "domain": ".google.com",
+                        "path": "/",
+                    }
+                ])
+            except:
+                pass
+
+            # --- PHASE 2.4: HEADER HARDENING ---
+            # Inject Referer to bypass simple paywalls/gateways
+            await context.set_extra_http_headers({
+                "Referer": random.choice(["https://www.google.com/", "https://t.co/", "https://www.bing.com/"]),
+                "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Upgrade-Insecure-Requests": "1"
+            })
+
             yield page, proxy_url
         except Exception as e:
             logger.error(f"Error using pooled page: {e}")
@@ -131,7 +166,34 @@ class BrowserPool:
 # Global pool instance
 browser_pool = BrowserPool(size=CURRENT_PROFILE["BROWSER_POOL_SIZE"])
 
-async def scrape_url(url: str, timeout: int = 30000, use_proxy: bool = True) -> str | None:
+async def handle_consent_screen(page):
+    """Detects and clicks 'Accept all' on Google/common consent screens."""
+    if "google.com" not in page.url: return False
+    try:
+        # Google-specific: Look for "Accept all" button (localized common variants)
+        selectors = [
+            'button:has-text("Accept all")',
+            'button:has-text("Agree")',
+            'button:has-text("I agree")',
+            'button:has-text("Accept")',
+            'button:has-text("Allow all")',
+            '[aria-label="Accept all"]',
+            'form[action*="consent"] button'
+        ]
+        for selector in selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=5000):
+                    logger.info(f"REGULATION-GUARD: Bypassing consent screen via selector: {selector}")
+                    await btn.click()
+                    await page.wait_for_timeout(1000)
+                    return True
+            except: continue
+    except:
+        pass
+    return False
+
+async def scrape_url(url: str, timeout: int = 15000, use_proxy: bool = True) -> str | None:
     """
     High-level async scraper using the pool with stealth applied.
     """
@@ -146,57 +208,92 @@ async def scrape_url(url: str, timeout: int = 30000, use_proxy: bool = True) -> 
         attempts = [False]
     last_proxy = None
     
+    proxy_retries = 0
+    max_proxy_retries = 3
+    
     for current_use_proxy in attempts:
-        try:
-            async with browser_pool.acquire_page(use_proxy=current_use_proxy) as (page, actual_proxy):
-                # actual_proxy stores whichever healthy proxy was pulled from the pool
-                last_proxy = actual_proxy
+        while True:
+            try:
+                async with browser_pool.acquire_page(use_proxy=current_use_proxy) as (page, actual_proxy):
+                    last_proxy = actual_proxy
 
-                # --- Optimized for Deep Content Extraction ---
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-                await page.wait_for_timeout(2000) # Wait for initial hydration
+                    # --- Optimized for Deep Content Extraction ---
+                    # Shifted to domcontentloaded for Phase 2.1 Optimization
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                    await page.wait_for_timeout(2000) # Wait for initial hydration
+                    
+                    # Check for and bypass Regulation/Consent walls
+                    await handle_consent_screen(page)
+                    
+                    # Multi-stage Deep Scroll (Bypasses Lazy Loading)
+                    # Reduced iterations for Speed Mode
+                    for i in range(2):
+                        await page.mouse.wheel(0, 1500)
+                        await page.wait_for_timeout(400)
+                    
+                    # Scroll back up slightly to trigger any "sticky" content blocks
+                    await page.mouse.wheel(0, -500)
+                    await page.wait_for_timeout(300)
+                    
+                    # Final stability wait (Reduced for Speed Mode)
+                    await page.wait_for_load_state("networkidle", timeout=2000)
+                    
+                    return await page.content()
+            except Exception as e:
+                # --- DOUBLE-CHECK RESILIENCE: Proxy Retry Logic ---
+                error_msg = str(e).lower()
+                is_proxy_error = any(msg in error_msg for msg in ["proxy", "tunnel", "connection refused", "connection reset", "name_not_resolved"])
                 
-                # Multi-stage Deep Scroll (Bypasses Lazy Loading)
-                # We scroll in 3 increments to trigger hydration of the main body
-                for i in range(3):
-                    await page.mouse.wheel(0, 1500)
-                    await page.wait_for_timeout(800)
+                if current_use_proxy and is_proxy_error and proxy_retries < max_proxy_retries:
+                    proxy_retries += 1
+                    if last_proxy:
+                        from scraper.network import ProxyGuard
+                        ProxyGuard.mark_unhealthy(last_proxy, duration=1200)
+                    logger.warning(f"PROXY-RETRY: Connection failed. Swapping proxy and retrying ({proxy_retries}/{max_proxy_retries})...")
+                    continue # Retry with a new proxy
                 
-                # Scroll back up slightly to trigger any "sticky" content blocks
-                await page.mouse.wheel(0, -500)
-                await page.wait_for_timeout(500)
+                # If we're out of retries or it's not a proxy error
+                if current_use_proxy:
+                    if "news.google.com" in url:
+                         logger.error(f"Scrape Proxy Tunnel Failed. ABORTING direct fallback for Google URL: {url}")
+                         return None
+                    if last_proxy:
+                        from scraper.network import ProxyGuard
+                        ProxyGuard.mark_unhealthy(last_proxy, duration=1200)
                 
-                # Final stability wait
-                await page.wait_for_load_state("networkidle", timeout=5000)
-                
-                return await page.content()
-        except Exception as e:
-            err_msg = str(e)
-            if current_use_proxy and any(p in err_msg for p in ["TUNNEL_CONNECTION_FAILED", "PROXY_CONNECTION_FAILED", "Proxy unavailable"]):
-                if last_proxy:
-                    from scraper.network import ProxyGuard
-                    ProxyGuard.mark_unhealthy(last_proxy, duration=600) # 10 min blacklist
-                
-                if is_google:
-                    logger.error(f"Scrape Proxy Tunnel Failed. ABORTING direct fallback for Google URL: {url}")
-                    return None
-                
-                logger.warning(f"Scrape Proxy Tunnel Failed. Retrying DIRECT for {url}...")
-                continue
-            logger.error(f"Stealth Pool Scraper error: {err_msg}")
-            return None
+                logger.error(f"Error using pooled page: {e}")
+                break # Exit the while loop to try next strategy in 'attempts'
     return None
 
-async def resolve_url_via_browser(url: str, timeout: int = 30000, use_proxy: bool = True) -> str:
+async def resolve_url_via_browser(url: str, timeout: int = 15000, use_proxy: bool = True) -> str:
     """
     Navigates to a URL using a stealthy browser to resolve redirects.
+    Includes Proxy-Retry resilience.
     """
     logger.info(f"Stealth Browser Resolution: Navigating to {url} (Proxy: {use_proxy})")
-    try:
-        async with browser_pool.acquire_page(use_proxy=use_proxy) as (page, _):
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            await page.wait_for_timeout(1000)
-            return page.url
-    except Exception as e:
-        logger.error(f"Stealth Browser resolution failed: {str(e)}")
-        return url
+    proxy_retries = 0
+    max_retries = 3
+
+    while True:
+        try:
+            async with browser_pool.acquire_page(use_proxy=use_proxy) as (page, actual_proxy):
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await page.wait_for_timeout(1000)
+                
+                # Ensure we aren't stuck on a consent redirect
+                await handle_consent_screen(page)
+                
+                return page.url
+        except Exception as e:
+            error_msg = str(e).lower()
+            is_proxy_error = any(msg in error_msg for msg in ["proxy", "tunnel", "connection refused"])
+            if use_proxy and is_proxy_error and proxy_retries < max_retries:
+                proxy_retries += 1
+                if actual_proxy:
+                    from scraper.network import ProxyGuard
+                    ProxyGuard.mark_unhealthy(actual_proxy, duration=1200)
+                logger.warning(f"RESOLVE-RETRY: Proxy failed. Attempting with new identity ({proxy_retries}/{max_retries})...")
+                continue
+            
+            logger.error(f"Stealth Browser Resolution error: {e}")
+            return url

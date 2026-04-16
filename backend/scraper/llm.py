@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import json
 import time
+import re
 from typing import Optional, List, Dict, Any
 import ollama
 
@@ -12,7 +13,7 @@ import ollama
 _groq_raw = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY") or ""
 GROQ_API_KEYS = [k.strip() for k in _groq_raw.split(",") if k.strip()]
 XAI_API_KEYS = [k.strip() for k in os.getenv("XAI_API_KEY", "").split(",") if k.strip()]
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
 # --- Redis for Global Throttling (C-7) ---
@@ -39,9 +40,39 @@ _ollama_semaphore = None
 def get_ollama_semaphore():
     global _ollama_semaphore
     if _ollama_semaphore is None:
-        # Optimized for USER hardware (RTX 3060 12GB + 64GB RAM)
-        _ollama_semaphore = asyncio.Semaphore(4) 
+        # Optimized concurrency for RTX 3060 (Speed Mode)
+        _ollama_semaphore = asyncio.Semaphore(3) 
     return _ollama_semaphore
+
+def safe_json_parse(text: str) -> Dict[str, Any]:
+    """Robust extractor that finds JSON within conversational AI responses."""
+    if not text: return {}
+    
+    # 1. Direct Try
+    try:
+        return json.loads(text.strip())
+    except:
+        pass
+        
+    # 2. Regex search for the largest {} block
+    try:
+        # Matches from the first { to the last }
+        match = re.search(r'(\{.*\})', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+    except:
+        pass
+        
+    # 3. Last ditch: simple find/rfind
+    try:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return json.loads(text[start:end+1])
+    except:
+        pass
+        
+    return {}
 
 def log(msg: str):
     from scraper.engine import logger
@@ -197,7 +228,7 @@ def extract_metadata_with_ollama(body: str, url: str = "", context_agency: str =
     try:
         # Use our existing hardware-tuned blocking call
         content = _call_ollama_blocking(prompt)
-        data = json.loads(content)
+        data = safe_json_parse(content)
         
         res_agency = data.get("agency")
         if not res_agency or res_agency.lower() in ["google", "google news"]:
@@ -225,12 +256,15 @@ def perform_full_enrichment_sync(body: str, title: str, url: str, sector: str, c
     
     # 1. Primary Extraction with Hardware-Tuned Ollama (Synchronous)
     try:
-        from scraper.graph import graphify_article, graph_to_context_string
+        # --- Graphify Disabled for Stability ---
+        # from scraper.graph import graphify_article, graph_to_context_string
+        # article_graph = {"nodes": [], "edges": []}
+        # graph_context = ""
+        # if len(body) > 3000:
+        #     article_graph = graphify_article(body, title=title)
+        #     graph_context = graph_to_context_string(article_graph)
         
-        # --- NEW: Graphify-First Architecture (Token Optimization) ---
-        # Map the article into a dense Knowledge Graph before summarization
-        article_graph = graphify_article(body, title=title)
-        graph_context = graph_to_context_string(article_graph)
+        graph_context = "" # Reset context to use full body
         
         meta = extract_metadata_with_ollama(
             body, 

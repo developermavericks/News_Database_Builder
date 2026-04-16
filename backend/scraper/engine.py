@@ -20,6 +20,7 @@ from sqlalchemy import select, update, insert, text, delete
 from sqlalchemy.dialects.postgresql import insert as pg_upsert
 from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 import hashlib
+from googlenewsdecoder import gnewsdecoder
 from scraper.network import NetworkHandler
 # from playwright.sync_api import sync_playwright
 # from playwright_stealth import Stealth
@@ -423,9 +424,17 @@ async def run_scrape_job(job_id, sector, region, date_from, date_to, search_mode
                                     try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
                                     except: pass
 
+                                # Decode Google News URL to avoid redirects/blocks in scraper phase
+                                try:
+                                    decoded = gnewsdecoder(link)
+                                    final_link = decoded.get("decoded_url", link)
+                                except Exception as de:
+                                    logger.warning(f"Decoding failed for {link}: {de}")
+                                    final_link = link
+
                                 all_discovered.append({
                                     "title": entry.title, 
-                                    "url": link, 
+                                    "url": final_link, 
                                     "published_at": pub_date_str, 
                                     "agency": entry.source.title if hasattr(entry, 'source') else "Google News"
                                 })

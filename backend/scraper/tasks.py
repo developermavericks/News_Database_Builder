@@ -75,12 +75,12 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
     from scraper.llm import get_redis_sync
     
     try:
+        url = article_data.get("url") or article_data.get("link")
         if is_job_cancelled(job_id):
             logger.info(f"Scrape task halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
             _mark_article_processed(job_id, article_url=url)
             return None
-
-        url = article_data.get("url") or article_data.get("link")
+        
         if not url:
             _mark_article_processed(job_id, article_url="unknown_missing_url")
             return None
@@ -112,23 +112,45 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id, sca
 
             # Use shared client (will be bare IP if proxy is deliberately None for non-Google)
             client = ScraperPersistence.get_sync_client(proxy=proxy, timeout=timeout)
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cookie": "CONSENT=YES+cb.20230531-17-p0.en+FX+908",
+            }
             resp = client.get(resolved_url, headers=headers)
             
+            # --- PHASE 3: CONTENT VALIDATION ---
             if resp.status_code == 200:
                 text_content = trafilatura.extract(resp.text)
                 is_paywall = any(p in resp.text.lower() for p in ["subscribe to read", "premium content", "log in to access", "sign up to keep reading"])
+                
+                # Check for "Thin Content" / Suspected Bot Block (Phase 3.1)
                 if text_content and len(text_content) > 500 and not is_paywall:
                     html = resp.text
                 else:
-                    logger.info(f"Fast-track content thin ({len(text_content) if text_content else 0} chars) or paywall detected for {resolved_url}. Escalating...")
-            elif resp.status_code in [403, 503] and proxy:
-                ProxyGuard.mark_unhealthy(proxy)
+                    reason = "Paywall" if is_paywall else "Thin Content (<500 chars)"
+                    logger.warning(f"Suspected Block / {reason} detected for {resolved_url}. Escalating to Browser Phase...")
+            
+            elif resp.status_code in [403, 429, 503]: # Phase 3.1: Explicitly handle Forbidden/Rate-Limited
+                logger.warning(f"Fast-track BLOCKED ({resp.status_code}) for {resolved_url}. Rotating proxy and escalating.")
+                if proxy:
+                    from scraper.network import ProxyGuard
+                    ProxyGuard.mark_unhealthy(proxy, duration=1200) # Full 20m cool-down
+        
         except Exception as e:
             if proxy:
                 from scraper.network import ProxyGuard
-                ProxyGuard.mark_unhealthy(proxy)
-            logger.debug(f"Fast-track failed for {resolved_url}: {e}")
+                ProxyGuard.mark_unhealthy(proxy, duration=1200)
+            logger.debug(f"Fast-track exception for {resolved_url}: {e}")
 
         # --- FALLBACK: POOLED BROWSER (Max Depth Extraction) ---
         if not html and not scaling_mode:
